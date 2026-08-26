@@ -33,19 +33,37 @@ def row_texts_for_df(df: pd.DataFrame) -> list[str]:
     return out
 
 
-def ingest_file(conn: db.sqlite3.Connection, path: str) -> str:
+def ingest_file(conn: db.sqlite3.Connection, path: str, on_progress=None) -> str:
+    def prog(frac: float, msg: str):
+        if on_progress:
+            on_progress(frac, msg)
+
+    prog(0.02, "正在读取文件…")
     df = clean_df(read_file(path))
+    prog(0.10, "文件读取完成")
     texts = row_texts_for_df(df)
     name = db.create_table_from_df(conn, os.path.basename(path), df, texts)
-    build_embeddings(conn, name)
+    prog(0.30, "已建表，开始生成向量…")
+    build_embeddings(conn, name, on_progress=prog)
+    prog(1.0, "导入完成")
     return name
 
 
-def build_embeddings(conn: db.sqlite3.Connection, name: str) -> None:
+def build_embeddings(conn: db.sqlite3.Connection, name: str, on_progress=None) -> None:
     rows = db.get_rows(conn, name)
     if not rows:
         return
     texts = [r["__row_text"] for r in rows]
-    vectors = llm.embed(texts)
+    vectors: list[list[float]] = []
+    n = len(texts)
+    batch = 32
+    for i in range(0, n, batch):
+        chunk = texts[i : i + batch]
+        vecs = llm.embed(chunk)
+        vectors.extend(vecs)
+        done = min(i + len(chunk), n)
+        if on_progress:
+            frac = 0.30 + (done / n) * 0.60
+            on_progress(frac, f"生成向量 {done}/{n}")
     db.create_vec_table(conn, name)
     db.upsert_embeddings(conn, name, [r["row_id"] for r in rows], vectors)

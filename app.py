@@ -4,10 +4,12 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
+import uuid
 from typing import Any
 
 import pandas as pd
-from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx
+from dash import Dash, dcc, html, dash_table, Input, Output, State, ctx, no_update
 import dash_bootstrap_components as dbc
 from dotenv import load_dotenv
 
@@ -43,6 +45,15 @@ app.layout = dbc.Container(
                             id="import-spinner",
                             children=[html.Div(id="import-status", className="text-muted small mt-2")],
                         ),
+                        dbc.Progress(
+                            id="import-progress",
+                            value=0,
+                            striped=True,
+                            animated=True,
+                            className="mt-2",
+                            style={"display": "none"},
+                        ),
+                        dbc.Alert(id="import-error", color="danger", is_open=False, className="mt-2"),
                         html.Hr(),
                         dbc.Label("选择参与搜索的表"),
                         dbc.Checklist(id="table-select", options=[], value=[]),
@@ -118,29 +129,75 @@ app.layout = dbc.Container(
             ]
         ),
         dcc.Store(id="selected-tables", data=[]),
+        dcc.Store(id="import-job", data=None),
         dcc.Interval(id="init-interval", n_intervals=0, max_intervals=1),
+        dcc.Interval(id="import-interval", interval=400, n_intervals=0),
     ],
 )
 
 
-def _import_uploaded(contents: str, filename: str):
-    if not contents:
-        return None
+_ingest_jobs: dict[str, dict] = {}
+
+
+def _set_progress(job_id: str, frac: float, msg: str):
+    job = _ingest_jobs.get(job_id)
+    if job:
+        job["progress"] = int(round(frac * 100))
+        job["status"] = msg
+
+
+def _finish_job(job_id: str, table: str | None = None, error: str | None = None):
+    job = _ingest_jobs.get(job_id)
+    if job:
+        job.update(done=True, table=table, error=error)
+
+
+def _run_ingest(job_id: str, tmp_path: str, filename: str):
+    try:
+        conn = db.get_conn()
+        try:
+            name = ingest.ingest_file(
+                conn, tmp_path, on_progress=lambda f, m: _set_progress(job_id, f, m)
+            )
+        finally:
+            conn.close()
+        _finish_job(job_id, table=name)
+    except Exception as e:  # noqa: BLE001 - reported to UI via job store
+        _finish_job(job_id, error=str(e))
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _start_ingest(contents: str, filename: str) -> str:
     _, b64 = contents.split(",", 1)
     raw = base64.b64decode(b64)
     suffix = os.path.splitext(filename)[1].lower()
     tmp_path = tempfile.NamedTemporaryFile(suffix=suffix, delete=False).name
     with open(tmp_path, "wb") as f:
         f.write(raw)
+    job_id = str(uuid.uuid4())
+    _ingest_jobs[job_id] = {
+        "progress": 0,
+        "status": "准备导入…",
+        "done": False,
+        "error": None,
+        "table": None,
+    }
+    threading.Thread(target=_run_ingest, args=(job_id, tmp_path, filename), daemon=True).start()
+    return job_id
+
+
+def _current_tables():
+    conn = db.get_conn()
     try:
-        conn = db.get_conn()
-        try:
-            name = ingest.ingest_file(conn, tmp_path)
-        finally:
-            conn.close()
+        tables = db.list_tables(conn)
     finally:
-        os.unlink(tmp_path)
-    return name
+        conn.close()
+    options = [{"label": t, "value": t} for t in tables]
+    return options, tables, options
 
 
 @app.callback(
@@ -148,40 +205,87 @@ def _import_uploaded(contents: str, filename: str):
     Output("table-select", "value"),
     Output("delete-table", "options"),
     Output("import-status", "children"),
+    Output("import-error", "children"),
+    Output("import-error", "is_open"),
+    Output("import-progress", "value"),
+    Output("import-progress", "children"),
+    Output("import-progress", "style"),
+    Output("import-job", "data"),
     Input("upload-data", "contents"),
     Input("upload-data", "filename"),
     Input("delete-btn", "n_clicks"),
     Input("init-interval", "n_intervals"),
+    Input("import-interval", "n_intervals"),
     State("delete-table", "value"),
+    State("import-job", "data"),
 )
-def refresh_tables(contents, filename, del_clicks, n_intervals, del_value):
+def refresh_tables(contents, filename, del_clicks, init_n, import_n, del_value, import_job):
     triggered = ctx.triggered_id
-    status = ""
-    if triggered == "upload-data" and contents:
-        try:
-            name = _import_uploaded(contents, filename)
-            status = f"已导入表：{name}"
-        except Exception as e:
-            status = f"导入失败：{e}"
-    elif triggered == "delete-btn" and del_clicks:
-        if del_value:
-            try:
-                conn = db.get_conn()
-                try:
-                    db.delete_table(conn, del_value)
-                finally:
-                    conn.close()
-                status = f"已删除表：{del_value}"
-            except Exception as e:
-                status = f"删除失败：{e}"
+    status = no_update
+    error_children = no_update
+    error_open = no_update
+    progress_val = no_update
+    progress_children = no_update
+    progress_style = no_update
+    new_job = import_job
+    value = no_update
+    options = no_update
+    delete_options = no_update
 
-    conn = db.get_conn()
-    try:
-        tables = db.list_tables(conn)
-    finally:
-        conn.close()
-    options = [{"label": t, "value": t} for t in tables]
-    return options, tables, options, status
+    if triggered == "upload-data" and contents:
+        new_job = _start_ingest(contents, filename)
+        status = "正在导入…"
+        progress_val = 0
+        progress_children = "0%"
+        progress_style = {"display": "block"}
+    elif triggered == "import-interval" and import_job:
+        job = _ingest_jobs.get(import_job)
+        if job:
+            if not job["done"]:
+                status = job["status"]
+                progress_val = job["progress"]
+                progress_children = f"{job['progress']}%"
+                progress_style = {"display": "block"}
+            else:
+                if job["error"]:
+                    error_children = f"导入失败：{job['error']}"
+                    error_open = True
+                    status = "导入失败"
+                else:
+                    status = f"已导入表：{job['table']}"
+                    progress_val = 100
+                    progress_children = "100%"
+                    error_children = ""
+                    error_open = False
+                progress_style = {"display": "none"}
+                new_job = None
+                options, value, delete_options = _current_tables()
+    elif triggered == "delete-btn" and del_clicks and del_value:
+        try:
+            conn = db.get_conn()
+            try:
+                db.delete_table(conn, del_value)
+            finally:
+                conn.close()
+            status = f"已删除表：{del_value}"
+        except Exception as e:
+            status = f"删除失败：{e}"
+        options, value, delete_options = _current_tables()
+    elif triggered == "init-interval":
+        options, value, delete_options = _current_tables()
+
+    return (
+        options,
+        value,
+        delete_options,
+        status,
+        error_children,
+        error_open,
+        progress_val,
+        progress_children,
+        progress_style,
+        new_job,
+    )
 
 
 @app.callback(

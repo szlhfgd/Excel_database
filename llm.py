@@ -6,6 +6,8 @@ def _client() -> OpenAI:
     return OpenAI(
         api_key=os.environ.get("SILICONFLOW_API_KEY", ""),
         base_url=os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"),
+        timeout=float(os.environ.get("LLM_TIMEOUT", "20")),
+        max_retries=0,
     )
 
 

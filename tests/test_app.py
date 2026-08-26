@@ -180,3 +180,129 @@ def test_empty_hint_messages():
         True,
     )
     assert app.update_empty_hint("sql", [], [{"label": "t", "value": "t"}]) == ("", False)
+
+
+def test_llm_client_has_timeout_and_no_retries(monkeypatch):
+    import llm as llm_mod
+
+    captured = {}
+
+    def fake(*args, **kwargs):
+        captured.update(kwargs)
+        return type("C", (), {})()
+
+    monkeypatch.setattr(llm_mod, "OpenAI", fake)
+    monkeypatch.setenv("LLM_TIMEOUT", "7")
+
+    llm_mod._client()
+    assert captured.get("timeout") == 7.0
+    assert captured.get("max_retries") == 0
+
+
+def test_import_progress_ids_present():
+    ids = _collect_ids(app.app.layout)
+    for expected in ("import-progress", "import-error", "import-job", "import-interval"):
+        assert expected in ids, f"missing id: {expected}"
+
+
+def test_run_ingest_records_failure(monkeypatch):
+    import types
+
+    monkeypatch.setattr(app.db, "get_conn", lambda: types.SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(
+        app.ingest,
+        "ingest_file",
+        lambda c, p, on_progress=None: (_ for _ in ()).throw(RuntimeError("embed api down")),
+    )
+    job_id = "fail1"
+    app._ingest_jobs[job_id] = {"progress": 0, "status": "", "done": False, "error": None, "table": None}
+    app._run_ingest(job_id, "fake.csv", "t.csv")
+    job = app._ingest_jobs[job_id]
+    assert job["done"] is True
+    assert job["error"] == "embed api down"
+    assert job["table"] is None
+
+
+def test_run_ingest_records_success(monkeypatch):
+    import types
+
+    monkeypatch.setattr(app.db, "get_conn", lambda: types.SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(app.ingest, "ingest_file", lambda c, p, on_progress=None: "mytable")
+    job_id = "ok1"
+    app._ingest_jobs[job_id] = {"progress": 0, "status": "", "done": False, "error": None, "table": None}
+    app._run_ingest(job_id, "fake.csv", "t.csv")
+    job = app._ingest_jobs[job_id]
+    assert job["done"] is True
+    assert job["table"] == "mytable"
+    assert job["error"] is None
+
+
+def test_refresh_tables_poll_surfaces_import_failure(monkeypatch):
+    import types
+
+    job_id = "fail1"
+    app._ingest_jobs[job_id] = {
+        "progress": 40,
+        "status": "生成向量 4/10",
+        "done": True,
+        "error": "embed api down",
+        "table": None,
+    }
+    app.ctx = types.SimpleNamespace(triggered_id="import-interval")
+    monkeypatch.setattr(app.db, "list_tables", lambda c: [])
+    out = app.refresh_tables(
+        contents=None,
+        filename=None,
+        del_clicks=None,
+        init_n=0,
+        import_n=1,
+        del_value=None,
+        import_job=job_id,
+    )
+    assert out[4] == "导入失败：embed api down"
+    assert out[5] is True
+    assert out[9] is None
+
+
+def test_refresh_tables_poll_surfaces_import_success(monkeypatch):
+    import types
+
+    job_id = "ok1"
+    app._ingest_jobs[job_id] = {
+        "progress": 100,
+        "status": "导入完成",
+        "done": True,
+        "error": None,
+        "table": "mytable",
+    }
+    app.ctx = types.SimpleNamespace(triggered_id="import-interval")
+    monkeypatch.setattr(app.db, "list_tables", lambda c: ["mytable"])
+    out = app.refresh_tables(
+        contents=None,
+        filename=None,
+        del_clicks=None,
+        init_n=0,
+        import_n=1,
+        del_value=None,
+        import_job=job_id,
+    )
+    assert "已导入表：mytable" in out[3]
+    assert out[5] is False
+    assert out[0] == [{"label": "mytable", "value": "mytable"}]
+    assert out[9] is None
+
+
+def test_ingest_file_emits_progress(monkeypatch):
+    import pandas as pd
+
+    df = pd.DataFrame({"a": [1, 2]})
+    monkeypatch.setattr(app.ingest, "read_file", lambda p: df)
+    monkeypatch.setattr(app.ingest, "clean_df", lambda d: d)
+    monkeypatch.setattr(app.db, "create_table_from_df", lambda c, n, d, t: "t1")
+    monkeypatch.setattr(app.ingest, "build_embeddings", lambda c, n, on_progress=None: None)
+
+    fracs = []
+    name = app.ingest.ingest_file(None, "x.csv", on_progress=lambda f, m: fracs.append(f))
+    assert name == "t1"
+    assert fracs[0] <= 0.10
+    assert fracs[-1] == 1.0
