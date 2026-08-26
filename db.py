@@ -2,20 +2,25 @@ import sqlite3
 import sqlite_vec
 import re
 import os
+import math
+import pandas as pd
 
 DB_PATH = os.environ.get("SPREADSHEET_DB", "spreadsheet.db")
 EMBED_DIM = 1024
 VEC_PREFIX = "vec_"
+_CJK = r"0-9a-zA-Z_\u4e00-\u9fff"
+
+
+def _sanitize(name: str, prefix: str, default: str) -> str:
+    cleaned = re.sub(r"[^" + _CJK + r"]", "_", name) or default
+    if cleaned[0].isdigit():
+        cleaned = prefix + cleaned
+    return cleaned
 
 
 def _sanitize_table_name(name: str) -> str:
     base = os.path.splitext(os.path.basename(name))[0]
-    cleaned = re.sub(r"[^0-9a-zA-Z_\u4e00-\u9fff]", "_", base)
-    if not cleaned:
-        cleaned = "table"
-    if cleaned[0].isdigit():
-        cleaned = "t_" + cleaned
-    return cleaned
+    return _sanitize(base, "t_", "table")
 
 
 def get_conn() -> sqlite3.Connection:
@@ -54,27 +59,18 @@ def create_table_from_df(conn: sqlite3.Connection, name: str, df, row_texts: lis
     safe = _sanitize_table_name(name)
     cols = []
     for col in df.columns:
-        cname = re.sub(r"[^0-9a-zA-Z_\u4e00-\u9fff]", "_", str(col)) or "col"
-        if cname[0].isdigit():
-            cname = "c_" + cname
+        cname = _sanitize(str(col), "c_", "col")
         cols.append((cname, _sql_type(str(df[col].dtype))))
     col_defs = ", ".join(f'"{c}" {t}' for c, t in cols)
     conn.execute(f'DROP TABLE IF EXISTS "{safe}"')
     conn.execute(f'CREATE TABLE "{safe}" (row_id INTEGER PRIMARY KEY AUTOINCREMENT, __row_text TEXT, {col_defs})')
     for i, (_, row) in enumerate(df.iterrows()):
-        values = [row_texts[i]] + [None if pd_is_na(row[c]) else row[c] for c, _ in cols]
+        values = [row_texts[i]] + [None if pd.isna(row[c]) else row[c] for c, _ in cols]
         placeholders = ", ".join(["?"] * (len(cols) + 1))
-        conn.execute(f'INSERT INTO "{safe}" (__row_text, {", ".join(chr(34)+c+chr(34) for c, _ in cols)}) VALUES ({placeholders})', values)
+        quoted = ", ".join(f'"{c}"' for c, _ in cols)
+        conn.execute(f'INSERT INTO "{safe}" (__row_text, {quoted}) VALUES ({placeholders})', values)
     conn.commit()
     return safe
-
-
-def pd_is_na(v) -> bool:
-    try:
-        import pandas as pd
-        return bool(pd.isna(v))
-    except Exception:
-        return v is None
 
 
 def get_rows(conn: sqlite3.Connection, name: str, limit: int | None = None) -> list[dict]:
@@ -99,6 +95,11 @@ def get_schema(conn: sqlite3.Connection, name: str) -> dict:
     return {"table": name, "columns": columns, "sample_rows": sample_rows}
 
 
+def _normalize(v: list[float]) -> list[float]:
+    norm = math.sqrt(sum(x * x for x in v))
+    return [x / norm for x in v] if norm else v
+
+
 def create_vec_table(conn: sqlite3.Connection, name: str) -> None:
     vname = VEC_PREFIX + name
     conn.execute(f'DROP TABLE IF EXISTS "{vname}"')
@@ -109,16 +110,16 @@ def create_vec_table(conn: sqlite3.Connection, name: str) -> None:
 def upsert_embeddings(conn: sqlite3.Connection, name: str, row_ids: list[int], vectors: list[list[float]]) -> None:
     vname = VEC_PREFIX + name
     for rid, vec in zip(row_ids, vectors):
-        blob = sqlite_vec.serialize_float32(vec)
+        blob = sqlite_vec.serialize_float32(_normalize(vec))
         conn.execute(f'INSERT INTO "{vname}" (rowid, embedding) VALUES (?, ?)', (rid, blob))
     conn.commit()
 
 
-def vec_search(conn: sqlite3.Connection, name: str, query_vec: list[float], k: int = 20) -> list[tuple[int, float]]:
+def vec_search(conn: sqlite3.Connection, name: str, query_vec: list[float], k: int | None = None) -> list[tuple[int, float]]:
     vname = VEC_PREFIX + name
-    blob = sqlite_vec.serialize_float32(query_vec)
-    rows = conn.execute(
-        f'SELECT rowid, distance FROM "{vname}" WHERE embedding MATCH ? ORDER BY distance LIMIT ?',
-        (blob, int(k)),
-    ).fetchall()
+    blob = sqlite_vec.serialize_float32(_normalize(query_vec))
+    sql = f'SELECT rowid, distance FROM "{vname}" WHERE embedding MATCH ? ORDER BY distance'
+    if k is not None:
+        sql += f" LIMIT {int(k)}"
+    rows = conn.execute(sql, (blob,)).fetchall()
     return [(r["rowid"], r["distance"]) for r in rows]

@@ -1,5 +1,7 @@
 import os
+import io
 import tempfile
+import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -53,19 +55,15 @@ def run_mode(conn, selected):
     mode = st.radio("查询模式", ["hybrid", "ask", "sql"], horizontal=True,
                     help="hybrid=语义+BM25 融合；ask=自然语言转SQL；sql=手写SQL")
     if mode == "sql":
-        sql = st.text_area("SQL", "SELECT * FROM ...")
-        if st.button("执行"):
+        sql = st.text_area("SQL", "SELECT * FROM 表名")
+        if st.button("执行") and sql.strip():
             try:
                 rows = conn.execute(sql).fetchall()
                 df = [dict(r) for r in rows]
             except Exception as e:
                 st.error(f"执行出错：{e}")
                 return
-            if not df:
-                st.info("未找到匹配行")
-                return
-            st.dataframe(df)
-            st.download_button("下载 CSV", _to_csv(df), "result.csv", "text/csv")
+            show_results(df)
     elif mode == "ask":
         q = st.text_input("用自然语言提问")
         if st.button("查询") and q:
@@ -86,13 +84,12 @@ def run_mode(conn, selected):
                 st.info("未找到匹配行")
                 return
             st.code(sql, language="sql")
-            st.dataframe(df)
-            st.download_button("下载 CSV", _to_csv(df), "result.csv", "text/csv")
+            show_results(df)
     else:
         q = st.text_input("混合搜索（关键词或短语）")
         if st.button("搜索") and q:
             vec = llm.embed([q])[0]
-            res = search.hybrid_search(conn, selected, q, vec, k=50)
+            res = search.hybrid_search(conn, selected, q, vec, k=None)
             st.write(f"命中 {len(res)} 行")
             for table, rid, score in res:
                 with st.expander(f"{table} · 行{rid} · 分数{score:.4f}"):
@@ -100,9 +97,15 @@ def run_mode(conn, selected):
                     st.json({k: v for k, v in row.items() if k != "__row_text"})
 
 
+def show_results(df: list[dict]) -> None:
+    if not df:
+        st.info("未找到匹配行")
+        return
+    st.dataframe(df)
+    st.download_button("下载 CSV", _to_csv(df), "result.csv", "text/csv")
+
+
 def _to_csv(df):
-    import io
-    import pandas as pd
     buf = io.StringIO()
     pd.DataFrame(df).to_csv(buf, index=False, encoding="utf-8-sig")
     return buf.getvalue().encode("utf-8-sig")

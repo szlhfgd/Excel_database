@@ -16,8 +16,7 @@ def test_hybrid_ranks_semantic_neighbor_first():
     db.create_vec_table(conn, name)
     db.upsert_embeddings(conn, name, [1, 2, 3], [vec1, vec2, vec2])
     query_vec = [0.9] + [0.0] * (db.EMBED_DIM - 1)
-    with mock.patch.object(llm_embed(), "embed", return_value=[query_vec]):
-        res = search.hybrid_search(conn, [name], "apple", query_vec, k=10)
+    res = search.hybrid_search(conn, [name], "apple", query_vec, k=10)
     assert res[0][1] == 1
 
 
