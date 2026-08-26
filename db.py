@@ -60,14 +60,14 @@ def create_table_from_df(conn: sqlite3.Connection, name: str, df, row_texts: lis
     cols = []
     for col in df.columns:
         cname = _sanitize(str(col), "c_", "col")
-        cols.append((cname, _sql_type(str(df[col].dtype))))
-    col_defs = ", ".join(f'"{c}" {t}' for c, t in cols)
+        cols.append((col, cname, _sql_type(str(df[col].dtype))))
+    col_defs = ", ".join(f'"{cname}" {t}' for _, cname, t in cols)
     conn.execute(f'DROP TABLE IF EXISTS "{safe}"')
     conn.execute(f'CREATE TABLE "{safe}" (row_id INTEGER PRIMARY KEY AUTOINCREMENT, __row_text TEXT, {col_defs})')
     for i, (_, row) in enumerate(df.iterrows()):
-        values = [row_texts[i]] + [None if pd.isna(row[c]) else row[c] for c, _ in cols]
+        values = [row_texts[i]] + [None if pd.isna(row[orig]) else row[orig] for orig, _, _ in cols]
         placeholders = ", ".join(["?"] * (len(cols) + 1))
-        quoted = ", ".join(f'"{c}"' for c, _ in cols)
+        quoted = ", ".join(f'"{cname}"' for _, cname, _ in cols)
         conn.execute(f'INSERT INTO "{safe}" (__row_text, {quoted}) VALUES ({placeholders})', values)
     conn.commit()
     return safe
@@ -118,8 +118,8 @@ def upsert_embeddings(conn: sqlite3.Connection, name: str, row_ids: list[int], v
 def vec_search(conn: sqlite3.Connection, name: str, query_vec: list[float], k: int | None = None) -> list[tuple[int, float]]:
     vname = VEC_PREFIX + name
     blob = sqlite_vec.serialize_float32(_normalize(query_vec))
-    sql = f'SELECT rowid, distance FROM "{vname}" WHERE embedding MATCH ? ORDER BY distance'
-    if k is not None:
-        sql += f" LIMIT {int(k)}"
+    if k is None:
+        k = conn.execute(f'SELECT COUNT(*) AS c FROM "{name}"').fetchone()["c"] or 1
+    sql = f'SELECT rowid, distance FROM "{vname}" WHERE embedding MATCH ? ORDER BY distance LIMIT {int(k)}'
     rows = conn.execute(sql, (blob,)).fetchall()
     return [(r["rowid"], r["distance"]) for r in rows]

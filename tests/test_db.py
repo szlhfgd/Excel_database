@@ -44,6 +44,32 @@ def test_vec_search_returns_nearest():
     assert res[0][1] < 1e-6
 
 
+def test_vec_search_unbounded_returns_all_rows():
+    conn = db.get_conn()
+    name = db.create_table_from_df(conn, "v.xlsx", __make_df(), ["x", "y", "z"])
+    db.create_vec_table(conn, name)
+    db.upsert_embeddings(conn, name, [1, 2, 3], [
+        [1.0] + [0.0] * (db.EMBED_DIM - 1),
+        [0.0] * db.EMBED_DIM,
+        [0.0] * db.EMBED_DIM,
+    ])
+    res = db.vec_search(conn, name, [1.0] + [0.0] * (db.EMBED_DIM - 1), k=None)
+    assert len(res) == 3
+
+
+def test_ingest_sanitizes_dirty_column_names():
+    conn = db.get_conn()
+    import pandas as pd
+    df = pd.DataFrame({"姓名, 姓名": ["alice", "bob"], "Unnamed: 1": [10, 20]})
+    name = db.create_table_from_df(conn, "脏列名.xlsx", df, ["r1", "r2"])
+    rows = db.get_rows(conn, name)
+    assert len(rows) == 2
+    cols = [c for c, _ in db.get_schema(conn, name)["columns"]]
+    assert "姓名__姓名" in cols
+    assert "Unnamed__1" in cols
+    assert rows[0]["姓名__姓名"] == "alice"
+
+
 def __make_df():
     import pandas as pd
     return pd.DataFrame({"name": ["a", "b", "c"], "val": [1, 2, 3]})
