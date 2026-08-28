@@ -1,1 +1,1 @@
-.\.venv\Scripts\python.exe app.py
+streamlit run app.py
