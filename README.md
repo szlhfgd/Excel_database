@@ -2,6 +2,7 @@
 
 一个基于 **Streamlit** 的电子表格数据库应用：把 Excel / CSV 导入 SQLite，并支持关键词搜索、自然语言转 SQL、智能问答（RAG）和统计等多种查询方式。
 
+
 ## 功能特性
 
 - **导入 Excel / CSV**：支持 `.xlsx` / `.xls` / `.csv`，可新建表、替换、按主键更新或合并。
@@ -25,6 +26,7 @@
 git clone https://github.com/szlhfgd/Excel_database.git
 cd Excel_database
 ```
+![Uploading image.png…]()
 
 ### 2. 创建虚拟环境并安装依赖
 
