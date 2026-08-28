@@ -1,0 +1,57 @@
+# 电子表格数据库 — 主题配置
+# 设计原则（creating-streamlit-themes）：中性底 + 一个品牌色（蓝），Inter 字体，8px 圆角
+# 改 primaryColor / 字体即可整体换肤，无需改任何 Python 代码
+
+[theme]
+base = "light"
+primaryColor = "#2563EB"                      # 按钮/链接/激活态（足够深，白字对比达标）
+backgroundColor = "#FFFFFF"                   # 主内容背景（最浅）
+secondaryBackgroundColor = "#F6F8FA"           # 卡片/控件背景（略深）
+textColor = "#1F2328"                         # 正文（深灰，与白底对比达标）
+linkColor = "#2563EB"
+borderColor = "#D0D7DE"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "8px"
+buttonRadius = "8px"
+
+font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+baseFontSize = 14
+linkUnderline = false
+
+# 语义色：badge / markdown 上色 / 状态
+blueColor = "#2563EB"
+greenColor = "#1A7F37"
+greenBackgroundColor = "#DAFBE1"
+greenTextColor = "#116329"
+redColor = "#CF222E"
+orangeColor = "#BF8700"
+violetColor = "#8250DF"
+grayColor = "#57606A"
+
+# 图表配色（Plotly/Altair 自动套用）
+chartCategoricalColors = ["#2563EB", "#1A7F37", "#BF3989", "#8250DF", "#CF222E", "#BF8700", "#57606A"]
+
+dataframeBorderColor = "#D0D7DE"
+dataframeHeaderBackgroundColor = "#F6F8FA"
+
+[theme.sidebar]
+backgroundColor = "#F6F8FA"
+secondaryBackgroundColor = "#EAEFF2"
+textColor = "#1F2328"
+borderColor = "#D0D7DE"
+primaryColor = "#2563EB"
+
+# 同时定义 light/dark，用户可在设置菜单切换
+[theme.light]
+primaryColor = "#2563EB"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F6F8FA"
+textColor = "#1F2328"
+
+[theme.dark]
+primaryColor = "#58A6FF"
+backgroundColor = "#0D1117"
+secondaryBackgroundColor = "#161B22"
+textColor = "#E6EDF3"

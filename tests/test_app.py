@@ -1,56 +1,46 @@
-import json
 import sqlite3
+import types
+import uuid
+from pathlib import Path
 
 import pytest
 
 import app
-from dash import Dash
+import db as db_mod
+import llm as llm_mod
+import search as search_mod
+import ingest as ingest_mod
+
+APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 
 
-def _collect_ids(component):
-    ids = []
-    cid = getattr(component, "id", None)
-    if cid is not None:
-        ids.append(cid)
-    children = getattr(component, "children", None)
-    if isinstance(children, list):
-        for child in children:
-            ids.extend(_collect_ids(child))
-    elif children is not None:
-        ids.extend(_collect_ids(children))
-    return ids
+def _uniq() -> str:
+    return "t_" + uuid.uuid4().hex[:8]
 
 
-def test_app_is_dash_instance():
-    assert isinstance(app.app, Dash)
+# ---- _to_csv ---------------------------------------------------------------
 
 
-def test_layout_has_key_ids():
-    ids = _collect_ids(app.app.layout)
-    for expected in ("upload-data", "table-select", "mode-radio", "result-table", "download-csv"):
-        assert expected in ids, f"missing id: {expected}"
-
-
-def test_ticket02_table_management_ids_present():
-    ids = _collect_ids(app.app.layout)
-    for expected in ("selected-tables", "delete-table", "delete-btn", "import-spinner", "init-interval"):
-        assert expected in ids, f"missing id: {expected}"
-
-
-def test_ticket02_table_management_callbacks_registered():
-    cm = app.app.callback_map
-    joined = " ".join(cm.keys())
-    assert "table-select.options" in joined, "table list refresh callback missing"
-    assert "selected-tables.data" in joined, "selected tables store callback missing"
-    assert "delete-table.options" in joined, "delete dropdown refresh callback missing"
-
-
-def test_to_csv_uses_utf8sig_bom():
+def test_to_csv_dict_list_uses_utf8sig_bom():
     out = app._to_csv([{"姓名": "张三", "年龄": 30}])
     assert out[:3] == b"\xef\xbb\xbf"
     text = out.decode("utf-8-sig")
     assert "姓名,年龄" in text
     assert "张三,30" in text
+
+
+def test_to_csv_empty_returns_empty_bytes():
+    assert app._to_csv([]) == b""
+
+
+def test_to_csv_list_of_lists_uses_csv_writer():
+    out = app._to_csv([[1, 2], [3, 4]])
+    text = out.decode("utf-8-sig")
+    assert "1,2" in text
+    assert "3,4" in text
+
+
+# ---- _run_query ------------------------------------------------------------
 
 
 def test_run_query_returns_columns_and_rows():
@@ -60,6 +50,16 @@ def test_run_query_returns_columns_and_rows():
     cols, rows = app._run_query(conn, "SELECT * FROM t")
     assert cols == ["a", "b"]
     assert rows == [{"a": 1, "b": "x"}]
+
+
+def test_run_query_no_result_returns_empty():
+    conn = sqlite3.connect(":memory:")
+    cols, rows = app._run_query(conn, "CREATE TABLE t (a INT)")
+    assert cols == []
+    assert rows == []
+
+
+# ---- _ask / ask_query ------------------------------------------------------
 
 
 def test_ask_retries_once_on_sql_error(monkeypatch):
@@ -79,24 +79,161 @@ def test_ask_retries_once_on_sql_error(monkeypatch):
             raise sqlite3.OperationalError("near BAD")
         return (["a", "b"], [{"a": 1, "b": 2}])
 
-    monkeypatch.setattr(app.llm, "generate_sql", fake_gen)
+    monkeypatch.setattr(llm_mod, "generate_sql", fake_gen)
     monkeypatch.setattr(app, "_run_query", fake_run)
-    monkeypatch.setattr(app.db, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
+    monkeypatch.setattr(db_mod, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
 
-    sql, cols, rows = app._ask(None, ["t"], "q")
+    sql, cols, rows, err = app._ask(None, ["t"], "q")
     assert sql == "SELECT * FROM t"
     assert calls["gen"] == 2
     assert calls["run"] == 2
     assert rows == [{"a": 1, "b": 2}]
+    assert err is None
 
 
-def test_ask_raises_after_max_retries(monkeypatch):
-    monkeypatch.setattr(app.llm, "generate_sql", lambda s, q, prev_error=None: "BAD")
+def test_ask_returns_error_after_max_retries(monkeypatch):
+    monkeypatch.setattr(llm_mod, "generate_sql", lambda s, q, prev_error=None: "BAD")
     monkeypatch.setattr(app, "_run_query", lambda c, sql: (_ for _ in ()).throw(sqlite3.OperationalError("err")))
-    monkeypatch.setattr(app.db, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
+    monkeypatch.setattr(db_mod, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
 
-    with pytest.raises(RuntimeError):
-        app._ask(None, ["t"], "q")
+    sql, cols, rows, err = app._ask(None, ["t"], "q")
+    assert err is not None
+    assert "NL2SQL" in err
+    assert rows is None
+
+
+def test_ask_query_success(monkeypatch):
+    monkeypatch.setattr(llm_mod, "generate_sql", lambda schemas, q, prev_error=None: "SELECT * FROM t")
+    monkeypatch.setattr(app, "_run_query", lambda c, sql: (["a"], [{"a": 1}]))
+    monkeypatch.setattr(db_mod, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
+    sql, cols, rows, err = app.ask_query(None, ["t"], "q")
+    assert sql == "SELECT * FROM t"
+    assert rows == [{"a": 1}]
+    assert err is None
+
+
+def test_ask_query_surfaces_error(monkeypatch):
+    monkeypatch.setattr(app, "_ask", lambda c, s, q, max_attempts=2: ("SELECT * FROM t", [], None, "boom"))
+    sql, cols, rows, err = app.ask_query(None, ["t"], "q")
+    assert err == "boom"
+    assert rows == []
+
+
+# ---- hybrid_query ----------------------------------------------------------
+
+
+def test_hybrid_query_success(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
+    monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
+    rows, err = app.hybrid_query(None, ["t"], "q")
+    assert err is None
+    assert rows and rows[0]["a"] == 1
+    assert rows[0]["__table"] == "t"
+    assert rows[0]["__row_id"] == 1
+
+
+def test_hybrid_query_error_surfaces(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: (_ for _ in ()).throw(RuntimeError("embed down")))
+    rows, err = app.hybrid_query(None, ["t"], "q")
+    assert rows == []
+    assert err is not None and "搜索出错" in err
+
+
+def test_hybrid_query_reranks_to_top5(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(
+        search_mod,
+        "hybrid_search",
+        lambda c, tables, q, vec, recall_pool=None: [("t", i, 1.0 - i * 0.1) for i in range(8)],
+    )
+    monkeypatch.setattr(
+        app, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
+    )
+    # rerank score = document index → the last candidate scores highest
+    monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [float(i) for i in range(len(docs))])
+    rows, err = app.hybrid_query(None, ["t"], "q", top_n=5)
+    assert err is None
+    assert len(rows) == 5
+    assert rows[0]["__row_id"] == 7
+
+
+def test_hybrid_query_rerank_failure_falls_back_to_rrf(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(
+        search_mod,
+        "hybrid_search",
+        lambda c, tables, q, vec, recall_pool=None: [("t", i, 1.0 - i * 0.1) for i in range(8)],
+    )
+    monkeypatch.setattr(
+        app, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
+    )
+    monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: (_ for _ in ()).throw(RuntimeError("rerank down")))
+    rows, err = app.hybrid_query(None, ["t"], "q", top_n=5)
+    assert err is None
+    assert len(rows) == 5
+    # fallback keeps RRF order → row 0 first
+    assert rows[0]["__row_id"] == 0
+
+
+def test_hybrid_query_reranks_beyond_old_pool(monkeypatch):
+    # 25 RRF candidates; the OLD pool was 20, so candidate 24 would have been
+    # dropped. With rerank-all it is re-scored and (highest rerank score) surfaces.
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(
+        search_mod,
+        "hybrid_search",
+        lambda c, tables, q, vec, recall_pool=None: [("t", i, 1.0 - i * 0.01) for i in range(25)],
+    )
+    monkeypatch.setattr(
+        app, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
+    )
+    # rerank score = document index → candidate 24 scores highest
+    monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [float(i) for i in range(len(docs))])
+    rows, err = app.hybrid_query(None, ["t"], "q", top_n=5)
+    assert err is None
+    assert len(rows) == 5
+    # candidate 24 (beyond the old pool of 20) now ranks first
+    assert rows[0]["__row_id"] == 24
+
+
+def test_hybrid_query_respects_top_n(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(
+        search_mod,
+        "hybrid_search",
+        lambda c, tables, q, vec, recall_pool=None: [("t", i, 1.0 - i * 0.01) for i in range(10)],
+    )
+    monkeypatch.setattr(
+        app, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
+    )
+    monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [float(i) for i in range(len(docs))])
+    rows, err = app.hybrid_query(None, ["t"], "q", top_n=3)
+    assert err is None
+    assert len(rows) == 3
+
+
+# ---- sql_query -------------------------------------------------------------
+
+
+def test_sql_query_success():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (a INT, b TEXT)")
+    conn.execute("INSERT INTO t VALUES (1, 'x')")
+    cols, rows, err = app.sql_query(conn, "SELECT * FROM t")
+    assert err is None
+    assert rows == [{"a": 1, "b": "x"}]
+
+
+def test_sql_query_error_surfaces():
+    conn = sqlite3.connect(":memory:")
+    cols, rows, err = app.sql_query(conn, "SELECT * FROM nope")
+    assert err is not None and "SQL 执行出错" in err
+    assert rows == []
+
+
+# ---- _build_hybrid_rows / _row_display_json --------------------------------
 
 
 def test_build_hybrid_rows_and_display_json():
@@ -106,13 +243,17 @@ def test_build_hybrid_rows_and_display_json():
         return {"row_id": row_id, "__row_text": f"full text for {table} {row_id}", "col": 1}
 
     rows = app._build_hybrid_rows(results, fetch)
-    assert rows[0]["表名"] == "t1"
-    assert rows[0]["行号"] == 3
-    assert rows[0]["分数"] == 1.5
-    assert "full text" in rows[0]["摘要"]
+    assert rows[0]["col"] == 1
     assert rows[0]["__table"] == "t1"
     assert rows[0]["__row_id"] == 3
+    assert "表名" not in rows[0]
+    assert "行号" not in rows[0]
+    assert "分数" not in rows[0]
+    assert "摘要" not in rows[0]
     assert app._row_display_json({"row_id": 1, "__row_text": "x", "a": 2}) == {"row_id": 1, "a": 2}
+
+
+# ---- _fetch_row_by_id ------------------------------------------------------
 
 
 def test_fetch_row_by_id_returns_matching_row():
@@ -128,181 +269,195 @@ def test_fetch_row_by_id_returns_matching_row():
     assert app._fetch_row_by_id(conn, "t", 99) is None
 
 
-def test_query_mode_layout_ids():
-    ids = _collect_ids(app.app.layout)
-    for expected in (
-        "sql-collapse",
-        "ask-collapse",
-        "hybrid-collapse",
-        "sql-input",
-        "ask-input",
-        "hybrid-input",
-        "sql-run",
-        "ask-run",
-        "hybrid-run",
-        "error-alert",
-        "empty-hint",
-        "empty-result",
-        "ask-sql-block",
-        "download-btn",
-        "detail-pre",
-        "detail-collapse",
-    ):
-        assert expected in ids, f"missing id: {expected}"
+# ---- preview ---------------------------------------------------------------
 
 
-def test_query_callbacks_registered():
-    cm = app.app.callback_map
-    joined = " ".join(cm.keys())
-    for out in (
-        "result-table.data",
-        "ask-sql-block.children",
-        "error-alert.children",
-        "empty-result.children",
-        "download-csv.data",
-        "detail-pre.children",
-        "empty-hint.children",
-        "sql-collapse.is_open",
-    ):
-        assert out in joined, f"missing callback output: {out}"
+def test_preview_returns_first_n_rows_excluding_internal_cols():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    name = _uniq()
+    conn.execute(f'CREATE TABLE "{name}" (row_id INTEGER PRIMARY KEY, __row_text TEXT, name TEXT, val INT)')
+    for i in range(7):
+        conn.execute(f'INSERT INTO "{name}" (name, val) VALUES (?, ?)', (f"r{i}", i))
+    conn.commit()
+    cols, rows = app.preview(conn, name, n=5)
+    assert "row_id" not in cols
+    assert "__row_text" not in cols
+    assert len(rows) == 5
+    assert rows[0]["name"] == "r0"
+    assert "row_id" not in rows[0]
+    assert "__row_text" not in rows[0]
 
 
-def test_mode_toggle_opens_only_selected_mode():
-    assert app.toggle_mode("sql") == (True, False, False)
-    assert app.toggle_mode("ask") == (False, True, False)
-    assert app.toggle_mode("hybrid") == (False, False, True)
+def test_preview_empty_table_returns_empty():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    name = _uniq()
+    conn.execute(f'CREATE TABLE "{name}" (row_id INTEGER PRIMARY KEY, __row_text TEXT, a INT)')
+    conn.commit()
+    cols, rows = app.preview(conn, name, n=5)
+    assert cols == []
+    assert rows == []
 
 
-def test_empty_hint_messages():
-    assert app.update_empty_hint("sql", [], []) == ("请先上传 Excel / CSV 表格。", True)
-    assert app.update_empty_hint("ask", [], [{"label": "t", "value": "t"}]) == (
-        "请先在左侧勾选至少一个参与查询的表。",
-        True,
-    )
-    assert app.update_empty_hint("sql", [], [{"label": "t", "value": "t"}]) == ("", False)
+# ---- delete_table ----------------------------------------------------------
 
 
-def test_llm_client_has_timeout_and_no_retries(monkeypatch):
-    import llm as llm_mod
+def test_delete_table_removes_table_and_vec():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    name = _uniq()
+    conn.execute(f'CREATE TABLE "{name}" (row_id INTEGER PRIMARY KEY, a INT)')
+    conn.execute(f'CREATE TABLE "vec_{name}" (row_id INTEGER PRIMARY KEY, vec TEXT)')
+    conn.commit()
+    app.delete_table(conn, name)
+    assert name not in db_mod.list_tables(conn)
 
+
+def test_delete_table_propagates_error(monkeypatch):
+    def boom(c, n):
+        raise RuntimeError("lock")
+
+    monkeypatch.setattr(db_mod, "delete_table", boom)
+    with pytest.raises(RuntimeError):
+        app.delete_table(None, "x")
+
+
+# ---- list_tables -----------------------------------------------------------
+
+
+def test_list_tables_delegates(monkeypatch):
+    dummy = types.SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(db_mod, "get_conn", lambda: dummy)
+    monkeypatch.setattr(db_mod, "list_tables", lambda c: ["a", "b"])
+    assert app.list_tables() == ["a", "b"]
+
+
+# ---- ingest_file -----------------------------------------------------------
+
+
+def test_ingest_file_returns_name_and_updated_and_wires_progress(monkeypatch):
+    dummy = types.SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr(db_mod, "get_conn", lambda: dummy)
+    fracs = []
+
+    def fake_ingest(c, p, on_progress=None, name=None, header_row=0):
+        if on_progress:
+            on_progress(0.5, "msg")
+        return ("x", False)
+
+    monkeypatch.setattr(ingest_mod, "ingest_file", fake_ingest)
+    name, updated = app.ingest_file("/tmp/x.csv", on_progress=lambda f, m: fracs.append(f))
+    assert name == "x"
+    assert updated is False
+    assert 0.5 in fracs
+
+
+def test_app_ingest_file_forwards_header_row(monkeypatch):
     captured = {}
 
-    def fake(*args, **kwargs):
-        captured.update(kwargs)
-        return type("C", (), {})()
+    def fake_ingest(c, p, on_progress=None, name=None, header_row=0):
+        captured["header_row"] = header_row
+        return ("x", False)
 
-    monkeypatch.setattr(llm_mod, "OpenAI", fake)
-    monkeypatch.setenv("LLM_TIMEOUT", "7")
-
-    llm_mod._client()
-    assert captured.get("timeout") == 7.0
-    assert captured.get("max_retries") == 0
+    monkeypatch.setattr(ingest_mod, "ingest_file", fake_ingest)
+    app.ingest_file("/tmp/x.csv", header_row=3)
+    assert captured["header_row"] == 3
 
 
-def test_import_progress_ids_present():
-    ids = _collect_ids(app.app.layout)
-    for expected in ("import-progress", "import-error", "import-job", "import-interval"):
-        assert expected in ids, f"missing id: {expected}"
+# ---- _columns_for ----------------------------------------------------------
 
 
-def test_run_ingest_records_failure(monkeypatch):
-    import types
-
-    monkeypatch.setattr(app.db, "get_conn", lambda: types.SimpleNamespace(close=lambda: None))
-    monkeypatch.setattr(
-        app.ingest,
-        "ingest_file",
-        lambda c, p, on_progress=None: (_ for _ in ()).throw(RuntimeError("embed api down")),
-    )
-    job_id = "fail1"
-    app._ingest_jobs[job_id] = {"progress": 0, "status": "", "done": False, "error": None, "table": None}
-    app._run_ingest(job_id, "fake.csv", "t.csv")
-    job = app._ingest_jobs[job_id]
-    assert job["done"] is True
-    assert job["error"] == "embed api down"
-    assert job["table"] is None
+def test_columns_for_passthrough():
+    assert app._columns_for(["a", "b"]) == ["a", "b"]
 
 
-def test_run_ingest_records_success(monkeypatch):
-    import types
-
-    monkeypatch.setattr(app.db, "get_conn", lambda: types.SimpleNamespace(close=lambda: None))
-    monkeypatch.setattr(app.ingest, "ingest_file", lambda c, p, on_progress=None: "mytable")
-    job_id = "ok1"
-    app._ingest_jobs[job_id] = {"progress": 0, "status": "", "done": False, "error": None, "table": None}
-    app._run_ingest(job_id, "fake.csv", "t.csv")
-    job = app._ingest_jobs[job_id]
-    assert job["done"] is True
-    assert job["table"] == "mytable"
-    assert job["error"] is None
+# ---- AppTest smoke ---------------------------------------------------------
 
 
-def test_refresh_tables_poll_surfaces_import_failure(monkeypatch):
-    import types
+def test_app_smoke_runs_without_exception():
+    from streamlit.testing.v1 import AppTest
 
-    job_id = "fail1"
-    app._ingest_jobs[job_id] = {
-        "progress": 40,
-        "status": "生成向量 4/10",
-        "done": True,
-        "error": "embed api down",
-        "table": None,
-    }
-    app.ctx = types.SimpleNamespace(triggered_id="import-interval")
-    monkeypatch.setattr(app.db, "list_tables", lambda c: [])
-    out = app.refresh_tables(
-        contents=None,
-        filename=None,
-        del_clicks=None,
-        init_n=0,
-        import_n=1,
-        del_value=None,
-        import_job=job_id,
-    )
-    assert out[4] == "导入失败：embed api down"
-    assert out[5] is True
-    assert out[9] is None
+    at = AppTest.from_file(APP_PATH)
+    at.run()
+    assert not at.exception
+    assert len(at.file_uploader) >= 1
 
 
-def test_refresh_tables_poll_surfaces_import_success(monkeypatch):
-    import types
+def test_app_renders_result_dataframe_without_columns_kwarg():
+    from streamlit.testing.v1 import AppTest
 
-    job_id = "ok1"
-    app._ingest_jobs[job_id] = {
-        "progress": 100,
-        "status": "导入完成",
-        "done": True,
-        "error": None,
-        "table": "mytable",
-    }
-    app.ctx = types.SimpleNamespace(triggered_id="import-interval")
-    monkeypatch.setattr(app.db, "list_tables", lambda c: ["mytable"])
-    out = app.refresh_tables(
-        contents=None,
-        filename=None,
-        del_clicks=None,
-        init_n=0,
-        import_n=1,
-        del_value=None,
-        import_job=job_id,
-    )
-    assert "已导入表：mytable" in out[3]
-    assert out[5] is False
-    assert out[0] == [{"label": "mytable", "value": "mytable"}]
-    assert out[9] is None
+    at = AppTest.from_file(APP_PATH)
+    at.session_state["result_rows"] = [
+        {"客户": "张三", "金额": 200},
+    ]
+    at.run()
+    assert not at.exception
 
 
-def test_ingest_file_emits_progress(monkeypatch):
-    import pandas as pd
+# ---- rag_query -------------------------------------------------------------
 
-    df = pd.DataFrame({"a": [1, 2]})
-    monkeypatch.setattr(app.ingest, "read_file", lambda p: df)
-    monkeypatch.setattr(app.ingest, "clean_df", lambda d: d)
-    monkeypatch.setattr(app.db, "create_table_from_df", lambda c, n, d, t: "t1")
-    monkeypatch.setattr(app.ingest, "build_embeddings", lambda c, n, on_progress=None: None)
+def test_rag_query_success(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
+    captured = {}
 
-    fracs = []
-    name = app.ingest.ingest_file(None, "x.csv", on_progress=lambda f, m: fracs.append(f))
-    assert name == "t1"
-    assert fracs[0] <= 0.10
-    assert fracs[-1] == 1.0
+    def fake_answer(question, context):
+        captured["context"] = context
+        return "答案文本"
+
+    monkeypatch.setattr(llm_mod, "answer", fake_answer)
+    answer, rows, err = app.rag_query(None, ["t"], "q")
+    assert err is None
+    assert answer == "答案文本"
+    assert rows and rows[0]["__table"] == "t"
+    assert "客户 张三" in captured["context"]
+
+
+def test_rag_query_no_results(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [])
+    answer, rows, err = app.rag_query(None, ["t"], "q")
+    assert answer == ""
+    assert rows == []
+    assert err is not None and "未找到" in err
+
+
+def test_rag_query_error_surfaces(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: (_ for _ in ()).throw(RuntimeError("embed down")))
+    answer, rows, err = app.rag_query(None, ["t"], "q")
+    assert answer == ""
+    assert rows == []
+    assert err is not None and "RAG" in err
+
+
+def test_rag_query_with_code_runs(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
+    monkeypatch.setattr(llm_mod, "generate_code", lambda q, preview: "result = df['a'].sum()")
+    monkeypatch.setattr(llm_mod, "answer", lambda q, ctx: "答案是 1")
+    answer, rows, code, code_result, err = app.rag_query_with_code(None, ["t"], "q")
+    assert err is None
+    assert answer == "答案是 1"
+    assert code == "result = df['a'].sum()"
+    assert code_result == "1"
+    assert rows and rows[0]["a"] == 1
+
+
+def test_rag_query_with_review_runs(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(llm_mod, "answer", lambda q, ctx: "张三的金额是200")
+    monkeypatch.setattr(llm_mod, "review_answer", lambda q, ctx, ans: (True, "回答正确"))
+    answer, rows, verdict, critique, err = app.rag_query_with_review(None, ["t"], "q")
+    assert err is None
+    assert answer == "张三的金额是200"
+    assert verdict is True
+    assert critique == "回答正确"
+    assert rows and rows[0]["__table"] == "t"

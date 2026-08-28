@@ -4,10 +4,12 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** superseded
 
-- [ ] `requirements.txt` 列出 dash / dash-bootstrap-components 及既有后端依赖，不含 streamlit
-- [ ] `app.py` 构建 `dash.Dash` 实例并注册 `app.run(debug=True, port=8050)` 入口
-- [ ] 两栏布局渲染：左侧控制栏占位 + 右侧主区占位，UI 文案为中文
-- [ ] `tests/test_app.py` 冒烟测试通过：导入 `app`，断言其为 `Dash` 实例且布局包含上传/表多选/模式切换/结果表/下载等关键 `id`
-- [ ] `python app.py` 能在本机 8050 启动且不报导入错误
+> 用户后续改回 Streamlit（见 `02-streamlit-rebuild.md`）。本脚手架的 Dash 实现已被取代。
+
+- [x] `requirements.txt` 列出 dash / dash-bootstrap-components 及既有后端依赖，不含 streamlit
+- [x] `app.py` 构建 `dash.Dash` 实例并注册 `app.run(debug=True, port=8050)` 入口
+- [x] 两栏布局渲染：左侧控制栏占位 + 右侧主区占位，UI 文案为中文
+- [x] `tests/test_app.py` 冒烟测试通过：导入 `app`，断言其为 `Dash` 实例且布局包含上传/表多选/模式切换/结果表/下载等关键 `id`
+- [x] `python app.py` 能在本机 8050 启动且不报导入错误

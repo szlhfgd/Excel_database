@@ -1,8 +1,8 @@
-dash>=2.18
-dash-bootstrap-components>=1.6
+streamlit>=1.57
 pandas>=2.0
 openai>=1.0
 sqlite-vec>=0.1.9
 rank-bm25>=0.2.2
+jieba>=0.42
 python-dotenv>=1.0
 pytest>=8.0
