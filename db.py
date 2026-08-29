@@ -214,6 +214,52 @@ def summarize(conn: sqlite3.Connection, name: str) -> dict:
     return {"row_count": row_count, "columns": result_columns}
 
 
+def column_value_counts(conn: sqlite3.Connection, name: str, col: str, limit: int = 10) -> list[tuple[str, int]]:
+    """Return top *limit* (value, count) pairs for a text column, ordered by count desc."""
+    rows = conn.execute(
+        f'SELECT "{col}" AS v, COUNT(*) AS cnt '
+        f'FROM "{name}" '
+        f'WHERE "{col}" IS NOT NULL '
+        f'GROUP BY "{col}" '
+        f'ORDER BY cnt DESC '
+        f'LIMIT ?',
+        (limit,),
+    ).fetchall()
+    return [(str(r["v"]), r["cnt"]) for r in rows]
+
+
+def numeric_bins(conn: sqlite3.Connection, name: str, col: str, bins: int = 20) -> list[tuple[str, int]]:
+    """Return (bin_label, count) pairs for a numeric column histogram.
+
+    Automatically determines min/max from the data and divides into *bins* equal-width buckets.
+    Non-null values only.
+    """
+    stats = conn.execute(
+        f'SELECT MIN("{col}") AS mn, MAX("{col}") AS mx FROM "{name}" WHERE "{col}" IS NOT NULL'
+    ).fetchone()
+    if stats is None or stats["mn"] is None or stats["mx"] is None:
+        return []
+    mn, mx = float(stats["mn"]), float(stats["mx"])
+    if mn == mx:
+        return [(str(mn), conn.execute(f'SELECT COUNT(*) AS c FROM "{name}" WHERE "{col}" IS NOT NULL').fetchone()["c"])]
+    bucket_width = (mx - mn) / bins
+    # Use SQL to bucket efficiently: floor((val - mn) / width) gives 0-based bucket index
+    rows = conn.execute(
+        f'SELECT CAST((_v - ?) / ? AS INTEGER) AS bucket, COUNT(*) AS cnt '
+        f'FROM (SELECT "{col}" AS _v FROM "{name}" WHERE "{col}" IS NOT NULL) '
+        f'GROUP BY bucket ORDER BY bucket',
+        (mn, bucket_width),
+    ).fetchall()
+    result = []
+    for r in rows:
+        b = r["bucket"]
+        lo = mn + b * bucket_width
+        hi = lo + bucket_width
+        # Format range label
+        result.append((f"{lo:.2f}–{hi:.2f}", r["cnt"]))
+    return result
+
+
 def _normalize(v: list[float]) -> list[float]:
     norm = math.sqrt(sum(x * x for x in v))
     return [x / norm for x in v] if norm else v

@@ -490,6 +490,66 @@ def stats_query(
         return None, f"统计出错：{exc}"
 
 
+def build_stats_data(
+    conn: sqlite3.Connection,
+    table: str,
+    bins: int = 20,
+    top_n: int = 10,
+) -> dict:
+    """Gather all extra data needed for the enhanced stats visualizations.
+
+    Returns a dict with keys:
+    - ``numeric_bins``: {col_name: [(label, count), ...]}
+    - ``text_top_n``: {col_name: [(value, count), ...]}
+    - ``missing``: [{列名, 非空数, 缺失数, 填充率}, ...]
+    - ``numeric_compare``: [{列名, 求和, 平均}, ...] (only columns with non-null aggregates)
+
+    Framework-free for testability.
+    """
+    import db as _db
+
+    summary = _db.summarize(conn, table)
+    cols_meta = summary["columns"]
+    row_count = summary["row_count"]
+
+    # Numeric column histograms
+    num_bins: dict[str, list[tuple[str, int]]] = {}
+    for c in cols_meta:
+        if c["类型"] in ("INTEGER", "REAL") and c["非空数"] and c["非空数"] > 0:
+            num_bins[c["列名"]] = _db.numeric_bins(conn, table, c["列名"], bins=bins)
+
+    # Text column top-N value counts
+    text_top: dict[str, list[tuple[str, int]]] = {}
+    for c in cols_meta:
+        if c["类型"] == "TEXT" and c["非空数"] and c["非空数"] > 0:
+            text_top[c["列名"]] = _db.column_value_counts(conn, table, c["列名"], limit=top_n)
+
+    # Missing value data
+    missing = []
+    for c in cols_meta:
+        nn = c["非空数"] or 0
+        missing.append({
+            "列名": c["列名"],
+            "类型": c["类型"],
+            "非空数": nn,
+            "缺失数": row_count - nn,
+            "填充率": round(nn / row_count * 100, 1) if row_count else 0.0,
+        })
+
+    # Numeric comparison (求和/平均 side by side)
+    num_compare = []
+    for c in cols_meta:
+        if c["类型"] in ("INTEGER", "REAL") and c["求和"] is not None:
+            num_compare.append({"列名": c["列名"], "求和": c["求和"], "平均": round(c["平均"], 4) if c["平均"] else 0})
+
+    return {
+        "numeric_bins": num_bins,
+        "text_top_n": text_top,
+        "missing": missing,
+        "numeric_compare": num_compare,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
@@ -499,6 +559,7 @@ def main() -> None:
     import streamlit as st
     import db as _db
     import search as _search
+    import pandas as pd
 
     st.set_page_config(
         page_title="电子表格数据库",
@@ -842,6 +903,7 @@ def main() -> None:
                   conn = _db.get_conn()
                   try:
                       summary, err = stats_query(conn, selected)
+                      extra = build_stats_data(conn, selected[0]) if not err else {}
                   finally:
                       conn.close()
                   if err:
@@ -850,28 +912,96 @@ def main() -> None:
                       cols_meta = summary["columns"]
                       n_cols = len(cols_meta)
                       n_numeric = sum(1 for c in cols_meta if c["类型"] in ("INTEGER", "REAL"))
+                      n_text = n_cols - n_numeric
 
-                      # KPI row — horizontal bordered metric cards
+                      # ── KPI row ────────────────────────────────────────
                       with st.container(horizontal=True):
                           st.metric("总行数", summary["row_count"], border=True)
                           st.metric("列数", n_cols, border=True)
                           st.metric("数值列", n_numeric, border=True)
+                          st.metric("文本列", n_text, border=True)
 
-                      # Column type distribution
+                      # ── Column type distribution ───────────────────────
                       with st.container(border=True):
                           st.markdown("**列类型分布**")
-                          type_counts = {}
+                          type_counts: dict[str, int] = {}
                           for c in cols_meta:
                               type_counts[c["类型"]] = type_counts.get(c["类型"], 0) + 1
-                          dist_df = __import__("pandas").DataFrame(
+                          dist_df = pd.DataFrame(
                               {"类型": list(type_counts.keys()), "列数": list(type_counts.values())}
                           )
                           st.bar_chart(dist_df, x="类型", y="列数")
 
-                      # Per-column aggregates
-                      with st.container(border=True):
-                          st.markdown("**各列统计**")
-                          st.dataframe(cols_meta, hide_index=True, use_container_width=True)
+                      # ── Tabs for richer charts ─────────────────────────
+                      tab_labels = []
+                      if n_numeric > 0:
+                          tab_labels.append("数值列分布")
+                      if extra.get("numeric_compare"):
+                          tab_labels.append("数值列对比")
+                      if extra.get("text_top_n"):
+                          tab_labels.append("文本列 Top 值")
+                      if extra.get("missing"):
+                          tab_labels.append("缺失值概览")
+                      tab_labels.append("各列统计")
+
+                      if tab_labels:
+                          tabs = st.tabs(tab_labels)
+                          tab_idx = 0
+
+                          # Tab: Numeric distribution
+                          if n_numeric > 0:
+                              with tabs[tab_idx]:
+                                  st.markdown("**数值列分布**（直方图）")
+                                  for col_name, bins_data in extra.get("numeric_bins", {}).items():
+                                      if bins_data:
+                                          bin_df = pd.DataFrame({"区间": [b[0] for b in bins_data], "数量": [b[1] for b in bins_data]})
+                                          with st.expander(f"**{col_name}**", expanded=(len(extra.get("numeric_bins", {})) == 1)):
+                                              st.bar_chart(bin_df, x="区间", y="数量", height=200)
+                              tab_idx += 1
+
+                          # Tab: Numeric comparison
+                          if extra.get("numeric_compare"):
+                              with tabs[tab_idx]:
+                                  st.markdown("**数值列对比**（求和 / 平均）")
+                                  nc = extra["numeric_compare"]
+                                  # Horizontal bar chart for 求和
+                                  sum_df = pd.DataFrame({"列名": [r["列名"] for r in nc], "求和": [r["求和"] for r in nc]})
+                                  st.markdown("*求和*")
+                                  st.bar_chart(sum_df, x="列名", y="求和", horizontal=True)
+                                  # Average
+                                  avg_df = pd.DataFrame({"列名": [r["列名"] for r in nc], "平均": [r["平均"] for r in nc]})
+                                  st.markdown("*平均值*")
+                                  st.bar_chart(avg_df, x="列名", y="平均", horizontal=True)
+                              tab_idx += 1
+
+                          # Tab: Text top-N
+                          if extra.get("text_top_n"):
+                              with tabs[tab_idx]:
+                                  st.markdown("**文本列 Top 值**（出现频次最高的值）")
+                                  for col_name, pairs in extra["text_top_n"].items():
+                                      if pairs:
+                                          val_df = pd.DataFrame({"值": [p[0] for p in pairs], "数量": [p[1] for p in pairs]})
+                                          _dedup = next((c["去重数"] for c in cols_meta if c["列名"] == col_name), "—")
+                                          with st.expander(f"**{col_name}**（去重 {_dedup} 个）", expanded=(len(extra["text_top_n"]) == 1)):
+                                              st.bar_chart(val_df, x="值", y="数量", height=200)
+                              tab_idx += 1
+
+                          # Tab: Missing values
+                          if extra.get("missing"):
+                              with tabs[tab_idx]:
+                                  st.markdown("**缺失值概览**")
+                                  miss_df = pd.DataFrame(extra["missing"])
+                                  # Fill-rate bar chart
+                                  fr_df = pd.DataFrame({"列名": miss_df["列名"], "填充率 (%)": miss_df["填充率"]})
+                                  st.bar_chart(fr_df, x="列名", y="填充率 (%)", height=250)
+                                  # Detailed table below
+                                  st.dataframe(miss_df, hide_index=True, use_container_width=True)
+                              tab_idx += 1
+
+                          # Tab: Per-column aggregates (always last)
+                          with tabs[tab_idx]:
+                              st.markdown("**各列统计**")
+                              st.dataframe(cols_meta, hide_index=True, use_container_width=True)
 
       # ---- results area ----------------------------------------------------
       auto_used = st.session_state.get("auto_used_tables")
