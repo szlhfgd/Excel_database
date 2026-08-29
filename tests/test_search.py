@@ -106,3 +106,70 @@ def test_hybrid_respects_k():
     query_vec = [0.9] + [0.0] * (db.EMBED_DIM - 1)
     res = search.hybrid_search(conn, [name], "apple", query_vec, recall_pool=1)
     assert len(res) <= 2
+
+
+def test_select_tables_returns_top_k_by_relevance(monkeypatch):
+    # Two tables: "fruits" matches the question via BM25 token "apple",
+    # "cars" does not. select_tables should rank fruits first.
+    conn = db.get_conn()
+    fruits = db.create_table_from_df(
+        conn, "fruits.xlsx", pd.DataFrame({"t": ["apple fruit", "banana fruit"]}), ["apple fruit", "banana fruit"]
+    )
+    cars = db.create_table_from_df(
+        conn, "cars.xlsx", pd.DataFrame({"t": ["toyota car", "honda car"]}), ["toyota car", "honda car"]
+    )
+    # Real tables always have vec tables; create them with zero vectors so the
+    # semantic leg contributes nothing and BM25 token "apple" decides ranking.
+    for t in (fruits, cars):
+        db.create_vec_table(conn, t)
+        db.upsert_embeddings(conn, t, [1, 2], [[0.0] * db.EMBED_DIM, [0.0] * db.EMBED_DIM])
+    monkeypatch.setattr("llm.embed", lambda texts: [[0.0] * db.EMBED_DIM])
+    picked = search.select_tables(conn, "apple", k=2, recall_pool=20)
+    assert picked[0] == fruits
+    assert set(picked) == {fruits, cars}
+
+
+def test_select_tables_empty_db_returns_empty():
+    conn = db.get_conn()
+    assert search.select_tables(conn, "anything") == []
+
+
+def test_bm25_cache_reused_across_queries():
+    conn = db.get_conn()
+    name = _make_table(conn, ["apple banana fruit", "car dog vehicle", "apple car red"])
+    search._BM25_CACHE.clear()
+    # First query builds the index and populates the cache.
+    search._bm25_ranks(conn, name, "apple", k=None)
+    assert name in search._BM25_CACHE
+    sig, bm25, row_ids = search._BM25_CACHE[name]
+    assert row_ids == [1, 2, 3]
+    # Second query with unchanged data reuses the cached index (same object).
+    search._bm25_ranks(conn, name, "car", k=None)
+    assert search._BM25_CACHE[name][1] is bm25
+
+
+def test_bm25_cache_invalidated_on_data_change():
+    conn = db.get_conn()
+    name = _make_table(conn, ["apple banana fruit", "car dog vehicle", "apple car red"])
+    search._BM25_CACHE.clear()
+    res = search._bm25_ranks(conn, name, "apple", k=None)
+    assert {r[0] for r in res} == {1, 3}
+    # Update row 1's text in place (same row count and max row_id) — the
+    # signature must still change so the cache is rebuilt with fresh data.
+    conn.execute(f'UPDATE "{name}" SET "__row_text"=? WHERE row_id=1', ("zebra stripe",))
+    conn.commit()
+    res = search._bm25_ranks(conn, name, "apple", k=None)
+    assert {r[0] for r in res} == {3}
+    assert 1 not in {r[0] for r in res}
+
+
+def test_bm25_cache_cleared_on_drop():
+    conn = db.get_conn()
+    name = _make_table(conn, ["apple banana fruit"])
+    search._BM25_CACHE.clear()
+    search._bm25_ranks(conn, name, "apple", k=None)
+    assert name in search._BM25_CACHE
+    db.delete_table(conn, name)
+    # Dropping the table must not raise; stale cache entry is removed.
+    assert search._bm25_ranks(conn, name, "apple", k=None) == []
+    assert name not in search._BM25_CACHE

@@ -144,6 +144,18 @@ def test_get_schema_excludes_internal_columns():
     ]
 
 
+def test_get_schema_column_samples_distinct_non_null():
+    conn = db.get_conn()
+    df = pd.DataFrame({"name": ["a", "a", "b", None], "val": [1, 1, 2, 3]})
+    name = db.create_table_from_df(conn, "cs.xlsx", df, ["r1", "r2", "r3", "r4"])
+    schema = db.get_schema(conn, name)
+    samples = schema["column_samples"]
+    assert set(samples["name"]) == {"a", "b"}  # distinct, non-null
+    assert set(samples["val"]) == {"1", "2", "3"}
+    assert "row_id" not in samples
+    assert "__row_text" not in samples
+
+
 def test_list_tables_excludes_vec_tables():
     conn = db.get_conn()
     name = db.create_table_from_df(conn, "real.xlsx", pd.DataFrame({"a": [1, 2]}), ["x", "y"])

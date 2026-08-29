@@ -1,1 +1,1 @@
-streamlit run app.py
+D:\pywork\database\.venv\Scripts\streamlit.exe run app.py

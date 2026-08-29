@@ -253,6 +253,23 @@ def test_build_hybrid_rows_and_display_json():
     assert app._row_display_json({"row_id": 1, "__row_text": "x", "a": 2}) == {"row_id": 1, "a": 2}
 
 
+def test_build_hybrid_rows_skips_rows_with_no_visible_data():
+    results = [("t1", 1, 1.5), ("t2", 2, 0.8), ("t3", 3, 0.5)]
+
+    def fetch(table, row_id):
+        if table == "t1":
+            return {"row_id": row_id, "__row_text": "x", "name": "apple", "price": 10}
+        if table == "t2":
+            # All data columns empty/None → should be skipped (blank row).
+            return {"row_id": row_id, "__row_text": "x", "name": None, "price": None, "sheet": "S", "src_row": 5}
+        return {"row_id": row_id, "__row_text": "x", "name": "car", "price": 0}
+
+    rows = app._build_hybrid_rows(results, fetch)
+    assert [r["__table"] for r in rows] == ["t1", "t3"]
+    # price 0 is a real value, not empty — row must be kept.
+    assert rows[1]["price"] == 0
+
+
 # ---- _fetch_row_by_id ------------------------------------------------------
 
 
@@ -404,11 +421,12 @@ def test_rag_query_success(monkeypatch):
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
     captured = {}
 
-    def fake_answer(question, context):
+    def fake_answer(question, context, source=None):
         captured["context"] = context
         return "答案文本"
 
     monkeypatch.setattr(llm_mod, "answer", fake_answer)
+    monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
     answer, rows, err = app.rag_query(None, ["t"], "q")
     assert err is None
     assert answer == "答案文本"
@@ -416,13 +434,75 @@ def test_rag_query_success(monkeypatch):
     assert "客户 张三" in captured["context"]
 
 
-def test_rag_query_no_results(monkeypatch):
+def test_rag_query_rows_exist_but_cannot_answer_web_fallback(monkeypatch):
+    # Rows are retrieved but the LLM judges they can't answer the question →
+    # falls back to live web search.
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
+    monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: False)
+    captured = {}
+
+    def fake_answer(question, context, source=None):
+        captured["source"] = source
+        return "网络答案"
+
+    monkeypatch.setattr(llm_mod, "answer", fake_answer)
+    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("网络搜索结果文本", None))
+    answer, rows, err = app.rag_query(None, ["t"], "q")
+    assert err is None
+    assert answer == "网络答案"
+    assert rows == []
+    assert captured["source"] == "网络搜索（AnySearch）"
+
+
+def test_rag_query_no_results_web_fallback(monkeypatch):
+    # No DB rows → falls back to live web search via AnySearch.
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [])
+    captured = {}
+
+    def fake_answer(question, context, source=None):
+        captured["source"] = source
+        return "网络答案"
+
+    monkeypatch.setattr(llm_mod, "answer", fake_answer)
+    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("网络搜索结果文本", None))
+    answer, rows, err = app.rag_query(None, ["t"], "q")
+    assert err is None
+    assert answer == "网络答案"
+    assert rows == []
+    assert captured["source"] == "网络搜索（AnySearch）"
+
+
+def test_rag_query_no_results_web_search_fails(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [])
+    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("", "网络搜索失败：超时"))
     answer, rows, err = app.rag_query(None, ["t"], "q")
     assert answer == ""
     assert rows == []
-    assert err is not None and "未找到" in err
+    assert err is not None and "网络搜索" in err
+
+
+def test_rag_query_success_passes_db_source(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
+    captured = {}
+
+    def fake_answer(question, context, source=None):
+        captured["source"] = source
+        return "答案文本"
+
+    monkeypatch.setattr(llm_mod, "answer", fake_answer)
+    monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
+    answer, rows, err = app.rag_query(None, ["t"], "q")
+    assert err is None
+    assert answer == "答案文本"
+    assert captured["source"] == "数据库表格：t"
 
 
 def test_rag_query_error_surfaces(monkeypatch):
@@ -461,3 +541,64 @@ def test_rag_query_with_review_runs(monkeypatch):
     assert verdict is True
     assert critique == "回答正确"
     assert rows and rows[0]["__table"] == "t"
+
+
+def test_rag_query_decomposed_single_subquery_delegates(monkeypatch):
+    # decompose returns a single element → falls back to plain rag_query.
+    monkeypatch.setattr(db_mod, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
+    monkeypatch.setattr(llm_mod, "decompose_question", lambda q, s: [q])
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
+    monkeypatch.setattr(llm_mod, "answer", lambda q, ctx, source=None: "答案")
+    answer, rows, err = app.rag_query_decomposed(None, ["t"], "q")
+    assert err is None
+    assert answer == "答案"
+    assert rows and rows[0]["__table"] == "t"
+
+
+def test_rag_query_decomposed_multi_subquery_synthesizes(monkeypatch):
+    monkeypatch.setattr(db_mod, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
+    monkeypatch.setattr(llm_mod, "decompose_question", lambda q, s: ["子1", "子2"])
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
+    captured = {}
+
+    def fake_answer(question, context, source=None):
+        captured["ctx"] = context
+        return "综合答案"
+
+    monkeypatch.setattr(llm_mod, "answer", fake_answer)
+    answer, rows, err = app.rag_query_decomposed(None, ["t"], "q")
+    assert err is None
+    assert answer == "综合答案"
+    assert "子1" in captured["ctx"] and "子2" in captured["ctx"]
+    assert rows and rows[0]["__table"] == "t"
+
+
+def test_rag_query_dual_success(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(app, "ask_query", lambda c, s, q, max_attempts=2: ("SELECT 1", ["a"], [{"a": 1}], None))
+    monkeypatch.setattr(llm_mod, "cross_validate", lambda q, sql_ctx, text_ctx: "交叉验证答案")
+    answer, rows, sql, sql_ctx, err = app.rag_query_dual(None, ["t"], "q")
+    assert err is None
+    assert answer == "交叉验证答案"
+    assert sql == "SELECT 1"
+    assert "1" in sql_ctx
+    assert rows and rows[0]["__table"] == "t"
+
+
+def test_rag_query_dual_no_results(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [])
+    monkeypatch.setattr(app, "ask_query", lambda c, s, q, max_attempts=2: ("SELECT 1", [], [], None))
+    answer, rows, sql, sql_ctx, err = app.rag_query_dual(None, ["t"], "q")
+    assert answer == ""
+    assert rows == []
+    assert err is not None and "未找到" in err

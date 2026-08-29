@@ -57,13 +57,24 @@ def embed(texts: list[str]) -> list[list[float]]:
     return [d.embedding for d in resp.data]
 
 
+def _render_schema(s: dict) -> str:
+    """Render one table schema for the NL2SQL prompt.
+
+    Prefers per-column sample values (``column_samples``) when present —
+    they help the model pick the right column when names are ambiguous.
+    Falls back to whole-row ``sample_rows`` for backward compatibility.
+    """
+    header = f"表 `{s['table']}`:\n列: " + ", ".join(f"{c} {t}" for c, t in s["columns"])
+    col_samples = s.get("column_samples") or {}
+    lines = [f"{c}: {vals}" for c, vals in col_samples.items() if vals]
+    if lines:
+        return header + "\n列样例值:\n" + "\n".join(lines)
+    return header + "\n样本行:\n" + "\n".join(str(r) for r in s["sample_rows"])
+
+
 def generate_sql(table_schemas: list[dict], query: str, prev_error: str | None = None) -> str:
     model = os.environ.get("NL2SQL_MODEL", "deepseek-ai/DeepSeek-V3")
-    schema_block = "\n\n".join(
-        f"表 `{s['table']}`:\n列: " + ", ".join(f"{c} {t}" for c, t in s["columns"])
-        + "\n样本行:\n" + "\n".join(str(r) for r in s["sample_rows"])
-        for s in table_schemas
-    )
+    schema_block = "\n\n".join(_render_schema(s) for s in table_schemas)
     system = (
         "你是一个 SQLite 专家。根据用户自然语言问题，只输出一条可在 SQLite 执行的 SQL，"
         "不要解释，不要 markdown 代码块，只输出 SQL 本身。\n可用表结构：\n" + schema_block
@@ -87,20 +98,70 @@ def generate_sql(table_schemas: list[dict], query: str, prev_error: str | None =
     return sql.strip().rstrip(";")
 
 
+DECOMPOSE_SYSTEM_PROMPT = """你是一个查询分解助手。判断用户问题是否需要拆分成多个子查询来回答。
+规则：
+1. 如果问题简单、可以直接回答，输出包含原问题的单元素 JSON 数组；
+2. 如果问题复杂（涉及多步推理、多个条件、跨表或聚合计算），拆分成多个可独立求解的子查询；
+3. 每个子查询必须是完整、自包含的自然语言问题，不依赖其他子查询的结果；
+4. 只输出 JSON 数组，例如：["子查询1", "子查询2"]，不要输出其他内容。"""
+
+
+def decompose_question(question: str, schemas: list[dict]) -> list[str]:
+    """Decide whether *question* should be split into subqueries.
+
+    Returns a list of subqueries (at least one). If the model output cannot be
+    parsed, the original question is returned unchanged as a safe fallback.
+    """
+    model = os.environ.get("DECOMPOSE_MODEL", os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3"))
+    schema_block = "\n\n".join(
+        f"表 `{s['table']}`:\n列: " + ", ".join(f"{c} {t}" for c, t in s["columns"])
+        for s in schemas
+    )
+    system = DECOMPOSE_SYSTEM_PROMPT + "\n\n可用表结构：\n" + schema_block
+    resp = _client().chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": question},
+        ],
+        temperature=0.0,
+    )
+    content = (resp.choices[0].message.content or "").strip()
+    content = content.strip("`")
+    if content.lower().startswith("json"):
+        content = content[4:].strip()
+    try:
+        data = json.loads(content)
+        if isinstance(data, list):
+            subs = [str(x).strip() for x in data if str(x).strip()]
+            if subs:
+                return subs
+    except Exception:  # noqa: BLE001 - unparseable → fall back to the original question
+        pass
+    return [question]
+
+
 RAG_SYSTEM_PROMPT = """你是一名知识库问答助手，请严格依据【参考上下文】的内容回答用户问题。
 规则：
 1. 回答问题只能使用参考上下文提供的信息，禁止编造、臆测不存在的内容；
 2. 如果上下文没有答案，直接回复："根据现有知识库，未查询到相关信息"，不要强行回答；
 3. 不要输出上下文里没有提到的数据、人名、结论；
-4. 回答尽量简洁清晰，优先用原文事实，可适当改写，不要照搬大段原文；
-5. 不要在回答里提及"参考上下文、知识库、文档"这类字眼；
-6. 如果用户问题和上下文无关，直接告知无法解答。"""
+4. 优先引用原文事实，在事实基础上适当展开思考、推理和解释，使回答完整、有深度，但不得偏离事实、不得编造；
+5. 回答末尾另起一行标注信息来源，格式：【来源：...】；
+6. 不要在回答正文里提及"参考上下文、知识库、文档"这类字眼；
+7. 如果用户问题和上下文无关，直接告知无法解答。"""
 
 
-def answer(question: str, context: str) -> str:
-    """Answer *question* in natural language, grounded in *context* (retrieved rows)."""
+def answer(question: str, context: str, source: str | None = None) -> str:
+    """Answer *question* in natural language, grounded in *context* (retrieved rows).
+
+    When *source* is provided (e.g. "数据库表格：t1、t2" or "网络搜索（AnySearch）"),
+    the model is instructed to end the answer with a 【来源：...】 line.
+    """
     model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
     system = RAG_SYSTEM_PROMPT + "\n\n【参考上下文】\n" + context + "\n【/参考上下文】"
+    if source:
+        system += f"\n\n本次回答的信息来源为：{source}。请在回答末尾另起一行标注：【来源：{source}】。"
     resp = _client().chat.completions.create(
         model=model,
         messages=[
@@ -178,6 +239,37 @@ REVIEW_SYSTEM_PROMPT = """你是一名严谨的审核员。给定【用户问题
 只输出一行 JSON：{"verdict": "pass" 或 "fail", "reason": "简短说明"}。不要输出其他内容。"""
 
 
+CAN_ANSWER_SYSTEM_PROMPT = """你是一名判断助手。给定【用户问题】和【参考上下文】，判断参考上下文是否包含足够的信息来回答该问题。
+- 如果上下文能直接回答该问题（包含所需的事实、数据或依据），输出 true；
+- 如果上下文与问题无关、信息不足、或无法据此回答，输出 false。
+只输出一行 JSON：{"can_answer": true 或 false, "reason": "简短说明"}。不要输出其他内容。"""
+
+
+def can_answer(question: str, context: str) -> bool:
+    """Return whether *context* contains enough information to answer *question*.
+
+    Used by the RAG flow to decide whether to fall back to live web search when
+    the retrieved database rows do not actually answer the user's question.
+    """
+    import json
+
+    model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
+    user = f"【用户问题】\n{question}\n\n【参考上下文】\n{context}"
+    resp = _client().chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": CAN_ANSWER_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.0,
+    )
+    content = resp.choices[0].message.content.strip()
+    try:
+        return str(json.loads(content).get("can_answer", "false")).lower() == "true"
+    except Exception:  # noqa: BLE001 - on parse failure, assume the DB context can answer
+        return True
+
+
 def review_answer(question: str, context: str, answer: str) -> tuple[bool, str]:
     """Review *answer* against *question* and *context*. Returns ``(pass, reason)``."""
     import json
@@ -205,3 +297,34 @@ def review_answer(question: str, context: str, answer: str) -> tuple[bool, str]:
         verdict = False
         reason = content
     return verdict, reason
+
+
+CROSS_VALIDATE_SYSTEM_PROMPT = """你是一名数据核对助手。给定【用户问题】、【SQL 执行结果】和【文本检索上下文】，综合判断并给出最终答案。
+规则：
+1. 如果 SQL 执行结果为空或报错，依据文本检索上下文回答；
+2. 如果两者一致，直接输出一致的结果；
+3. 如果两者冲突，仔细分析：数值/聚合类事实以 SQL 执行结果为准，文本上下文作为补充说明；
+4. 只输出最终答案，不要解释过程，不要提及"SQL、上下文"等字眼。"""
+
+
+def cross_validate(question: str, sql_result: str, text_context: str) -> str:
+    """Arbitrate between an SQL execution result and text-retrieval context.
+
+    SQL results are authoritative for numeric/aggregate facts; text context is
+    the fallback when SQL is empty or errored. Returns the final answer.
+    """
+    model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
+    user = (
+        f"【用户问题】\n{question}\n\n"
+        f"【SQL 执行结果】\n{sql_result}\n\n"
+        f"【文本检索上下文】\n{text_context}"
+    )
+    resp = _client().chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": CROSS_VALIDATE_SYSTEM_PROMPT},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.0,
+    )
+    return (resp.choices[0].message.content or "").strip()

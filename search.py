@@ -5,6 +5,26 @@ from rank_bm25 import BM25Okapi
 
 RRF_K = 60
 
+# Cache of per-table BM25 indexes. Keyed by table name; value is
+# (signature, bm25, row_ids) where signature is a cheap SQL aggregate that
+# changes whenever the table's row text changes (insert/delete/update), so the
+# index is rebuilt lazily instead of on every query.
+_BM25_CACHE: dict[str, tuple[tuple, "BM25Okapi", list[int]]] = {}
+
+
+def _bm25_signature(conn: db.sqlite3.Connection, table: str) -> tuple:
+    """Return a lightweight signature of *table*'s row text.
+
+    Computed in SQL (no full row load into Python): row count, max row_id, and
+    the total length of all __row_text values. Any insert/delete/update that
+    changes row text alters at least one of these, invalidating the cache.
+    """
+    row = conn.execute(
+        f'SELECT COUNT(*) AS c, COALESCE(MAX(row_id), 0) AS m, '
+        f'COALESCE(SUM(length(__row_text)), 0) AS s FROM "{table}"'
+    ).fetchone()
+    return (row["c"], row["m"], row["s"])
+
 
 def _tokenize(text: str) -> list[str]:
     """中文按 jieba 词级切分（而非逐字），英文/数字按词切分。
@@ -29,19 +49,31 @@ def _semantic_ranks(conn: db.sqlite3.Connection, table: str, query_vec: list[flo
 
 
 def _bm25_ranks(conn: db.sqlite3.Connection, table: str, query: str, k: int | None) -> list[tuple[int, float]]:
-    rows = db.get_rows(conn, table)
-    if not rows:
+    try:
+        sig = _bm25_signature(conn, table)
+    except db.sqlite3.OperationalError:
+        # Table was dropped/recreated between calls — drop any stale cache.
+        _BM25_CACHE.pop(table, None)
         return []
-    corpus = [_tokenize(r["__row_text"]) for r in rows]
-    bm25 = BM25Okapi(corpus)
+    cached = _BM25_CACHE.get(table)
+    if cached is None or cached[0] != sig:
+        rows = db.get_rows(conn, table)
+        if not rows:
+            return []
+        corpus = [_tokenize(r["__row_text"]) for r in rows]
+        bm25 = BM25Okapi(corpus)
+        row_ids = [r["row_id"] for r in rows]
+        _BM25_CACHE[table] = (sig, bm25, row_ids)
+    else:
+        _, bm25, row_ids = cached
     tokens = _tokenize(query)
     if not tokens:
         return []
     scores = bm25.get_scores(tokens)
-    ranked = sorted(range(len(rows)), key=lambda i: scores[i], reverse=True)
+    ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
     if k is not None:
         ranked = ranked[:k]
-    return [(rows[i]["row_id"], float(scores[i])) for i in ranked if scores[i] > 0]
+    return [(row_ids[i], float(scores[i])) for i in ranked if scores[i] > 0]
 
 
 def hybrid_search(conn: db.sqlite3.Connection, tables: list[str], query: str, query_vec: list[float], recall_pool: int = 50) -> list[tuple[str, int, float]]:
@@ -54,3 +86,24 @@ def hybrid_search(conn: db.sqlite3.Connection, tables: list[str], query: str, qu
     results = [(t, rid, score) for (t, rid), score in fused.items()]
     results.sort(key=lambda x: x[2], reverse=True)
     return results
+
+
+def select_tables(conn: db.sqlite3.Connection, question: str, k: int = 3, recall_pool: int = 20) -> list[str]:
+    """Auto-pick the top-*k* most relevant tables for *question*.
+
+    Runs the existing hybrid search across every user table and aggregates the
+    RRF score by table, so the user doesn't have to select tables manually.
+    Returns [] when there are no tables.
+    """
+    import llm
+
+    tables = db.list_tables(conn)
+    if not tables:
+        return []
+    vec = llm.embed([question])[0]
+    results = hybrid_search(conn, tables, question, vec, recall_pool=recall_pool)
+    score_by_table: dict[str, float] = {}
+    for table, _rid, score in results:
+        score_by_table[table] = score_by_table.get(table, 0.0) + score
+    ranked = sorted(score_by_table.items(), key=lambda x: x[1], reverse=True)
+    return [t for t, _ in ranked[:k]]

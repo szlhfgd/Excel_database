@@ -140,6 +140,11 @@ def _build_hybrid_rows(
         row = fetch_row(table, row_id)
         if not row:
             continue
+        # Skip rows with no visible data (all data columns empty/None) — these
+        # would otherwise render as blank rows in the middle of the results.
+        data_cols = [k for k in row if k not in ("row_id", "__row_text", "sheet", "src_row")]
+        if not any(row.get(c) not in (None, "") for c in data_cols):
+            continue
         # Show the original row content (whole row); keep __table/__row_id
         # only as hidden keys for the detail view.
         data = {k: v for k, v in row.items() if k not in ("row_id", "__row_text")}
@@ -264,8 +269,36 @@ def rag_query(
             if full:
                 context_parts.append(full.get("__row_text") or json.dumps(_row_display_json(full), ensure_ascii=False))
         if not source_rows:
-            return "", [], "未找到相关的数据行。"
-        answer = _llm.answer(question, "\n".join(context_parts))
+            # No relevant rows in the database → fall back to live web search
+            # via AnySearch so the user still gets an answer.
+            import websearch as _web
+
+            web_text, web_err = _web.search(question, max_results=5)
+            if web_err:
+                return "", [], web_err
+            if not web_text:
+                return "", [], "未找到相关的数据行，且网络搜索无结果。"
+            answer = _llm.answer(question, web_text, source="网络搜索（AnySearch）")
+            return answer, [], None
+        context = "\n".join(context_parts)
+        # Rows were retrieved, but they may not actually answer the question
+        # (hybrid search returns *some* rows even when the DB lacks the info).
+        # If the context can't answer, fall back to live web search.
+        if not _llm.can_answer(question, context):
+            import websearch as _web
+
+            web_text, web_err = _web.search(question, max_results=5)
+            if web_err:
+                return "", [], web_err
+            if not web_text:
+                return "", [], "未找到相关的数据行，且网络搜索无结果。"
+            answer = _llm.answer(question, web_text, source="网络搜索（AnySearch）")
+            return answer, [], None
+        answer = _llm.answer(
+            question,
+            context,
+            source="数据库表格：" + "、".join(selected),
+        )
         return answer, source_rows, None
     except Exception as exc:  # noqa: BLE001
         return "", [], f"RAG 问答出错：{exc}"
@@ -353,6 +386,90 @@ def rag_query_with_review(
         return "", [], False, "", f"RAG 审核问答出错：{exc}"
 
 
+def rag_query_decomposed(
+    conn: sqlite3.Connection,
+    selected: list[str],
+    question: str,
+    recall_pool: int = 50,
+    top_n: int = 5,
+) -> tuple[str, list[dict], str | None]:
+    """RAG Q&A with subquery decomposition.
+
+    Asks the LLM whether the question should be split into subqueries, solves
+    each via :func:`rag_query`, then synthesizes a final answer.
+    Returns ``(answer, source_rows, error | None)``.
+    """
+    import db as _db
+    import llm as _llm
+
+    try:
+        schemas = [_db.get_schema(conn, t) for t in selected]
+        subqueries = _llm.decompose_question(question, schemas)
+        if len(subqueries) <= 1:
+            return rag_query(conn, selected, question, recall_pool=recall_pool, top_n=top_n)
+        parts: list[str] = []
+        all_rows: list[dict] = []
+        for sq in subqueries:
+            ans, rows, err = rag_query(conn, selected, sq, recall_pool=recall_pool, top_n=top_n)
+            if err:
+                parts.append(f"子问题：{sq}\n答案：{err}")
+            else:
+                parts.append(f"子问题：{sq}\n答案：{ans}")
+            all_rows.extend(rows)
+        if not all_rows:
+            return "", [], "未找到相关的数据行。"
+        final = _llm.answer(question, "\n\n".join(parts))
+        return final, all_rows, None
+    except Exception as exc:  # noqa: BLE001
+        return "", [], f"子查询分解问答出错：{exc}"
+
+
+def rag_query_dual(
+    conn: sqlite3.Connection,
+    selected: list[str],
+    question: str,
+    recall_pool: int = 50,
+    top_n: int = 5,
+    max_attempts: int = 2,
+) -> tuple[str, list[dict], str, str, str | None]:
+    """RAG Q&A with SQL + text dual-path cross-validation.
+
+    Runs NL2SQL (via :func:`ask_query`) and text retrieval (the same hybrid
+    search + rerank pipeline as :func:`rag_query`), then has the LLM arbitrate
+    between the two. Returns ``(answer, source_rows, sql, sql_context, error)``.
+    """
+    import llm as _llm
+    import search as _search
+
+    try:
+        # SQL path
+        sql, _cols, sql_rows, sql_err = ask_query(conn, selected, question, max_attempts=max_attempts)
+        if sql_err or not sql_rows:
+            sql_context = f"SQL 执行失败：{sql_err}" if sql_err else "SQL 无结果"
+        else:
+            sql_context = "\n".join(str(r) for r in sql_rows)
+
+        # Text path
+        vec = _llm.embed([question])[0]
+        results = _search.hybrid_search(conn, selected, question, vec, recall_pool=recall_pool)
+        top = _rerank_results(conn, question, results, top_n=top_n)
+        source_rows = _build_hybrid_rows(top, lambda t, r: _fetch_row_by_id(conn, t, r))
+        context_parts: list[str] = []
+        for row in source_rows:
+            full = _fetch_row_by_id(conn, row["__table"], row["__row_id"])
+            if full:
+                context_parts.append(
+                    full.get("__row_text") or json.dumps(_row_display_json(full), ensure_ascii=False)
+                )
+        text_context = "\n".join(context_parts)
+        if not source_rows and (sql_err or not sql_rows):
+            return "", [], sql, sql_context, "未找到相关的数据行。"
+        answer = _llm.cross_validate(question, sql_context, text_context)
+        return answer, source_rows, sql, sql_context, None
+    except Exception as exc:  # noqa: BLE001
+        return "", [], "", "", f"SQL+文本交叉验证出错：{exc}"
+
+
 def stats_query(
     conn: sqlite3.Connection,
     selected: list[str],
@@ -381,6 +498,7 @@ def stats_query(
 def main() -> None:
     import streamlit as st
     import db as _db
+    import search as _search
 
     st.set_page_config(
         page_title="电子表格数据库",
@@ -402,6 +520,12 @@ def main() -> None:
         st.session_state.show_detail_row = None
     if "rag_answer" not in st.session_state:
         st.session_state.rag_answer = None
+    if "rag_dual_sql" not in st.session_state:
+        st.session_state.rag_dual_sql = None
+    if "rag_dual_ctx" not in st.session_state:
+        st.session_state.rag_dual_ctx = None
+    if "auto_used_tables" not in st.session_state:
+        st.session_state.auto_used_tables = None
 
     # ---- main area: table selection (above sidebar so `selected` is in scope) --
     tables = list_tables()
@@ -410,6 +534,11 @@ def main() -> None:
             "选择参与搜索的表",
             options=tables,
             default=[],
+        )
+        auto_select = st.checkbox(
+            "自动选择表",
+            value=False,
+            help="开启后，每次查询自动从所有表中选出与问题最相关的表（最多 3 张），无需手动勾选。",
         )
         if tables:
             st.caption(f"共 {len(tables)} 张表" + (f" · 已选 {len(selected)}" if selected else ""))
@@ -540,15 +669,17 @@ def main() -> None:
           if st.button("搜索", type="primary", icon=":material/search:"):
               if not query or not query.strip():
                   st.warning("请输入搜索内容。")
-              elif not selected:
-                  st.warning("请先在上方选择至少一个参与查询的表。")
+              elif not selected and not auto_select:
+                  st.warning("请先在上方选择至少一个参与查询的表，或开启自动选择表。")
               else:
                   conn = _db.get_conn()
                   try:
-                      rows, err = hybrid_query(conn, selected, query, score_floor_frac=score_floor,
+                      use_tables = _search.select_tables(conn, query, k=3) if auto_select else selected
+                      rows, err = hybrid_query(conn, use_tables, query, score_floor_frac=score_floor,
                                                view_mode=view_mode, top_n=top_n, recall_pool=50)
                   finally:
                       conn.close()
+                  st.session_state.auto_used_tables = use_tables if auto_select else None
                   if err:
                       st.error(err)
                   elif not rows:
@@ -569,14 +700,16 @@ def main() -> None:
           if st.button("提问", type="primary", icon=":material/help:"):
               if not question or not question.strip():
                   st.warning("请输入问题。")
-              elif not selected:
-                  st.warning("请先在上方选择至少一个参与查询的表。")
+              elif not selected and not auto_select:
+                  st.warning("请先在上方选择至少一个参与查询的表，或开启自动选择表。")
               else:
                   conn = _db.get_conn()
                   try:
-                      sql, cols, rows, err = ask_query(conn, selected, question)
+                      use_tables = _search.select_tables(conn, question, k=3) if auto_select else selected
+                      sql, cols, rows, err = ask_query(conn, use_tables, question)
                   finally:
                       conn.close()
+                  st.session_state.auto_used_tables = use_tables if auto_select else None
                   if err:
                       st.error(err)
                   else:
@@ -625,24 +758,52 @@ def main() -> None:
       elif mode == "rag":
           question = st.text_area("用自然语言提问（基于数据库内容回答）", placeholder="例如：哪些客户的金额超过 100？", height=80)
           use_code_interpreter = st.toggle("启用代码解释器", key="rag_use_code")
+          use_decompose = st.toggle(
+              "启用子查询分解",
+              key="rag_decompose",
+              help="复杂问题先拆分为多个子查询逐个求解，再综合回答。",
+          )
+          use_dual = st.toggle(
+              "SQL+文本交叉验证",
+              key="rag_dual",
+              help="同时用 SQL 和文本检索回答，交叉验证冲突。与子查询分解互斥，分解优先。",
+          )
           if st.button("问答", type="primary", icon=":material/chat:"):
               if not question or not question.strip():
                   st.warning("请输入问题。")
-              elif not selected:
-                  st.warning("请先在上方选择至少一个参与查询的表。")
+              elif not selected and not auto_select:
+                  st.warning("请先在上方选择至少一个参与查询的表，或开启自动选择表。")
               else:
                   conn = _db.get_conn()
                   try:
-                      if use_code_interpreter:
-                          answer_text, rows, code, code_result, err = rag_query_with_code(conn, selected, question, top_n=top_n)
-                          st.session_state.rag_code = code
-                          st.session_state.rag_code_result = code_result
-                      else:
-                          answer_text, rows, err = rag_query(conn, selected, question, top_n=top_n)
+                      use_tables = _search.select_tables(conn, question, k=3) if auto_select else selected
+                      if use_decompose:
+                          answer_text, rows, err = rag_query_decomposed(conn, use_tables, question, top_n=top_n)
                           st.session_state.rag_code = None
                           st.session_state.rag_code_result = None
+                          st.session_state.rag_dual_sql = None
+                          st.session_state.rag_dual_ctx = None
+                      elif use_dual:
+                          answer_text, rows, sql_str, sql_ctx, err = rag_query_dual(conn, use_tables, question, top_n=top_n)
+                          st.session_state.rag_code = None
+                          st.session_state.rag_code_result = None
+                          st.session_state.rag_dual_sql = sql_str
+                          st.session_state.rag_dual_ctx = sql_ctx
+                      elif use_code_interpreter:
+                          answer_text, rows, code, code_result, err = rag_query_with_code(conn, use_tables, question, top_n=top_n)
+                          st.session_state.rag_code = code
+                          st.session_state.rag_code_result = code_result
+                          st.session_state.rag_dual_sql = None
+                          st.session_state.rag_dual_ctx = None
+                      else:
+                          answer_text, rows, err = rag_query(conn, use_tables, question, top_n=top_n)
+                          st.session_state.rag_code = None
+                          st.session_state.rag_code_result = None
+                          st.session_state.rag_dual_sql = None
+                          st.session_state.rag_dual_ctx = None
                   finally:
                       conn.close()
+                  st.session_state.auto_used_tables = use_tables if auto_select else None
                   if err:
                       st.error(err)
                   else:
@@ -666,6 +827,11 @@ def main() -> None:
               st.code(st.session_state.rag_code, language="python")
               st.markdown("**代码执行结果**")
               st.code(st.session_state.rag_code_result)
+
+          if st.session_state.get("rag_dual_sql"):
+              with st.expander("SQL 执行结果"):
+                  st.code(st.session_state.rag_dual_sql, language="sql")
+                  st.code(st.session_state.rag_dual_ctx)
 
       # -- stats mode --------------------------------------------------------
       elif mode == "统计":
@@ -708,6 +874,9 @@ def main() -> None:
                           st.dataframe(cols_meta, hide_index=True, use_container_width=True)
 
       # ---- results area ----------------------------------------------------
+      auto_used = st.session_state.get("auto_used_tables")
+      if auto_used:
+          st.caption(f"自动选择表：{'、'.join(auto_used)}")
       if result_rows:
           st.subheader("查询结果", divider=False)
           df_data = [

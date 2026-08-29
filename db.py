@@ -154,7 +154,20 @@ def get_schema(conn: sqlite3.Connection, name: str) -> dict:
     columns = [(r["name"], r["type"]) for r in cols if r["name"] not in ("row_id", "__row_text")]
     sample = conn.execute(f'SELECT * FROM "{name}" LIMIT 3').fetchall()
     sample_rows = [{k: v for k, v in dict(r).items() if k != "__row_text"} for r in sample]
-    return {"table": name, "columns": columns, "sample_rows": sample_rows}
+    # Per-column distinct sample values (up to 3 each) — helps NL2SQL pick the
+    # right column when names are ambiguous (borrowed from TableRAG).
+    column_samples: dict[str, list[str]] = {}
+    for col, _ in columns:
+        vals = conn.execute(
+            f'SELECT DISTINCT "{col}" AS v FROM "{name}" WHERE "{col}" IS NOT NULL LIMIT 3'
+        ).fetchall()
+        column_samples[col] = [str(r["v"]) for r in vals]
+    return {
+        "table": name,
+        "columns": columns,
+        "sample_rows": sample_rows,
+        "column_samples": column_samples,
+    }
 
 
 def summarize(conn: sqlite3.Connection, name: str) -> dict:

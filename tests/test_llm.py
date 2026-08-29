@@ -267,3 +267,227 @@ def test_review_answer_fallback_on_bad_json():
         verdict, reason = llm.review_answer("q", "ctx", "ans")
     assert verdict is False
     assert reason == "not json at all"
+
+
+def test_can_answer_true_when_context_sufficient():
+    import llm
+    from unittest import mock
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = type("M", (), {"content": content})()
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return FakeResp('{"can_answer": true, "reason": "上下文包含答案"}')
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        assert llm.can_answer("q", "ctx") is True
+
+
+def test_can_answer_false_when_context_insufficient():
+    import llm
+    from unittest import mock
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = type("M", (), {"content": content})()
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return FakeResp('{"can_answer": false, "reason": "上下文无关"}')
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        assert llm.can_answer("q", "ctx") is False
+
+
+def test_can_answer_defaults_true_on_bad_json():
+    import llm
+    from unittest import mock
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = type("M", (), {"content": content})()
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return FakeResp("not json at all")
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        assert llm.can_answer("q", "ctx") is True
+
+
+def test_generate_sql_renders_column_samples_when_present():
+    import llm
+    from unittest import mock
+
+    captured = {}
+
+    class FakeMsg:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = FakeMsg(content)
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResp("SELECT * FROM `t`")
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    schema = {
+        "table": "t",
+        "columns": [("a", "INTEGER"), ("b", "TEXT")],
+        "sample_rows": [],
+        "column_samples": {"a": ["1", "2"], "b": ["x"]},
+    }
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        sql = llm.generate_sql([schema], "全部")
+    content = captured["messages"][0]["content"]
+    assert "列样例值" in content
+    assert "a" in content and "1" in content
+    assert "样本行" not in content
+
+
+def test_generate_sql_falls_back_to_sample_rows_without_column_samples():
+    import llm
+    from unittest import mock
+
+    captured = {}
+
+    class FakeMsg:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = FakeMsg(content)
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResp("SELECT * FROM `t`")
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    schema = {"table": "t", "columns": [("a", "INTEGER")], "sample_rows": [{"a": 1}]}
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        llm.generate_sql([schema], "全部")
+    content = captured["messages"][0]["content"]
+    assert "样本行" in content
+    assert "列样例值" not in content
+
+
+def test_decompose_question_parses_json_array():
+    import llm
+    from unittest import mock
+
+    captured = {}
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = type("M", (), {"content": content})()
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResp('["子问题1", "子问题2"]')
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        out = llm.decompose_question("原问题", [{"table": "t", "columns": [], "sample_rows": []}])
+    assert out == ["子问题1", "子问题2"]
+
+
+def test_decompose_question_fallback_on_unparseable():
+    import llm
+    from unittest import mock
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = type("M", (), {"content": content})()
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            return FakeResp("完全不是 JSON")
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        out = llm.decompose_question("原问题", [{"table": "t", "columns": [], "sample_rows": []}])
+    assert out == ["原问题"]
+
+
+def test_cross_validate_returns_content():
+    import llm
+    from unittest import mock
+
+    captured = {}
+
+    class FakeChoice:
+        def __init__(self, content):
+            self.message = type("M", (), {"content": content})()
+
+    class FakeResp:
+        def __init__(self, content):
+            self.choices = [FakeChoice(content)]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResp("最终答案")
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        final = llm.cross_validate("问题", "SQL 结果", "文本上下文")
+    assert final == "最终答案"
+    assert "问题" in captured["messages"][1]["content"]
+    assert "SQL 结果" in captured["messages"][1]["content"]
+    assert "文本上下文" in captured["messages"][1]["content"]
