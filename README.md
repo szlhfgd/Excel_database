@@ -26,7 +26,7 @@ git clone https://github.com/szlhfgd/Excel_database.git
 cd Excel_database
 ```
 
-![Uploading image.png…]()
+![应用界面截图](Snipaste_2026-08-28_18-46-18.png)
 
 ### 2. 创建虚拟环境并安装依赖
 
