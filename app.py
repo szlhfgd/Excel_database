@@ -643,6 +643,8 @@ def main() -> None:
         st.session_state.rag_dual_ctx = None
     if "auto_used_tables" not in st.session_state:
         st.session_state.auto_used_tables = None
+    if "_result_mode_active" not in st.session_state:
+        st.session_state._result_mode_active = "hybrid"
 
     # ---- main area: table selection (above sidebar so `selected` is in scope) --
     tables = list_tables()
@@ -764,6 +766,15 @@ def main() -> None:
           default="hybrid",
           format_func=lambda m: _MODE_LABELS.get(m, m),
       )
+
+      # 切换查询模式时清空上一次查询的结果，避免不同模式的结果互相串扰；
+      # 结果区会在当前模式真正查询到新结果后才显示。
+      if st.session_state.get("_result_mode_active") != mode:
+          for _k in ("result_rows", "result_mode", "ask_sql", "rag_answer",
+                     "rag_code", "rag_code_result", "rag_dual_sql", "rag_dual_ctx",
+                     "show_detail_row", "auto_used_tables"):
+              st.session_state[_k] = [] if _k == "result_rows" else None
+          st.session_state._result_mode_active = mode
 
       # 显示条数 — 仅对使用它的查询方式（混合搜索 / 智能问答）显示，且各自独立记忆
       if mode == "hybrid":
