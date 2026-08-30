@@ -502,7 +502,7 @@ def test_rag_query_success_passes_db_source(monkeypatch):
     answer, rows, err = app.rag_query(None, ["t"], "q")
     assert err is None
     assert answer == "答案文本"
-    assert captured["source"] == "数据库表格：t"
+    assert captured["source"] == "数据库表格：t（行 1）"
 
 
 def test_rag_query_error_surfaces(monkeypatch):
@@ -519,7 +519,7 @@ def test_rag_query_with_code_runs(monkeypatch):
     monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
     monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
     monkeypatch.setattr(llm_mod, "generate_code", lambda q, preview: "result = df['a'].sum()")
-    monkeypatch.setattr(llm_mod, "answer", lambda q, ctx: "答案是 1")
+    monkeypatch.setattr(llm_mod, "answer", lambda q, ctx, source=None: "答案是 1")
     answer, rows, code, code_result, err = app.rag_query_with_code(None, ["t"], "q")
     assert err is None
     assert answer == "答案是 1"
@@ -533,7 +533,7 @@ def test_rag_query_with_review_runs(monkeypatch):
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
     monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
     monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
-    monkeypatch.setattr(llm_mod, "answer", lambda q, ctx: "张三的金额是200")
+    monkeypatch.setattr(llm_mod, "answer", lambda q, ctx, source=None: "张三的金额是200")
     monkeypatch.setattr(llm_mod, "review_answer", lambda q, ctx, ans: (True, "回答正确"))
     answer, rows, verdict, critique, err = app.rag_query_with_review(None, ["t"], "q")
     assert err is None
@@ -552,6 +552,7 @@ def test_rag_query_decomposed_single_subquery_delegates(monkeypatch):
     monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
     monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
     monkeypatch.setattr(llm_mod, "answer", lambda q, ctx, source=None: "答案")
+    monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
     answer, rows, err = app.rag_query_decomposed(None, ["t"], "q")
     assert err is None
     assert answer == "答案"
@@ -572,6 +573,7 @@ def test_rag_query_decomposed_multi_subquery_synthesizes(monkeypatch):
         return "综合答案"
 
     monkeypatch.setattr(llm_mod, "answer", fake_answer)
+    monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
     answer, rows, err = app.rag_query_decomposed(None, ["t"], "q")
     assert err is None
     assert answer == "综合答案"
@@ -588,7 +590,8 @@ def test_rag_query_dual_success(monkeypatch):
     monkeypatch.setattr(llm_mod, "cross_validate", lambda q, sql_ctx, text_ctx: "交叉验证答案")
     answer, rows, sql, sql_ctx, err = app.rag_query_dual(None, ["t"], "q")
     assert err is None
-    assert answer == "交叉验证答案"
+    assert answer.startswith("交叉验证答案")
+    assert "【来源：数据库表格：t（行 1）】" in answer
     assert sql == "SELECT 1"
     assert "1" in sql_ctx
     assert rows and rows[0]["__table"] == "t"

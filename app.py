@@ -136,7 +136,7 @@ def _build_hybrid_rows(
     fetch_row,
 ) -> list[dict]:
     out = []
-    for table, row_id, _score in results:
+    for table, row_id, score in results:
         row = fetch_row(table, row_id)
         if not row:
             continue
@@ -150,8 +150,51 @@ def _build_hybrid_rows(
         data = {k: v for k, v in row.items() if k not in ("row_id", "__row_text")}
         data["__table"] = table
         data["__row_id"] = row_id
+        # Relevance score for display (normalized to 0..1 by hybrid_query; raw
+        # rerank score for RAG callers). Surfaced as the "相关度" column.
+        data["相关度"] = round(score, 3)
         out.append(data)
     return out
+
+
+def _build_source_label(source_rows: list[dict]) -> str:
+    """Build a table→rows source citation, e.g.
+
+    '数据库表格：销售记录（行 3、7、12）、客户表（行 5）'.
+
+    Groups retrieved rows by table and lists the specific row ids that fed the
+    answer, so the citation points at concrete evidence instead of whole tables.
+    """
+    from collections import OrderedDict
+
+    by_table: "OrderedDict[str, list]" = OrderedDict()
+    for r in source_rows:
+        t = r.get("__table")
+        rid = r.get("__row_id")
+        if t is None or rid is None:
+            continue
+        by_table.setdefault(t, []).append(rid)
+    if not by_table:
+        return ""
+    parts = []
+    for t, rids in by_table.items():
+        uniq = sorted(set(rids))
+        parts.append(f"{t}（行 {('、'.join(str(x) for x in uniq))}）")
+    return "数据库表格：" + "、".join(parts)
+
+
+def _row_has_visible_data(row: dict) -> bool:
+    """True if *row* has at least one non-empty visible (non-internal) value.
+
+    Used by the results view to hide fully-empty rows. Mirrors the emptiness
+    check in :func:`_build_hybrid_rows` but also covers raw SQL/NL2SQL rows.
+    """
+    for k, v in row.items():
+        if k.startswith("__") or k in ("row_id", "__row_text", "sheet", "src_row"):
+            continue
+        if v not in (None, ""):
+            return True
+    return False
 
 
 def _row_display_json(row: dict) -> dict:
@@ -205,12 +248,15 @@ def hybrid_query(
     view_mode: str = "rerank",   # "rerank" | "fusion"
     top_n: int = 20,
     recall_pool: int = 50,
+    min_results: int = 0,
 ) -> tuple[list[dict], str | None]:
     """Hybrid search: BM25 + embedding → RRF fusion → rerank → top *top_n*.
 
     ``score_floor_frac`` is a 0..1 fraction of the max score (works for both
     rerank and fusion views). ``view_mode`` selects reranked vs raw-fused order.
-    Returns ``(rows, error | None)``.
+    ``min_results`` is a safety floor: when enough candidates exist, the
+    relevance threshold will not reduce results below this many rows (still
+    capped by *top_n*). Returns ``(rows, error | None)``.
     """
     import llm as _llm
     import search as _search
@@ -225,9 +271,16 @@ def hybrid_query(
             floor = score_floor_frac * max_score
             filtered = [r for r in chosen if r[2] >= floor]
         else:
+            max_score = 1.0
             filtered = []
         top = filtered[:top_n]
-        rows = _build_hybrid_rows(top, lambda t, r: _fetch_row_by_id(conn, t, r))
+        # Safety floor: never let the threshold drop results below min_results
+        # when enough candidates exist (still capped by top_n).
+        if min_results and len(top) < min_results and len(chosen) >= min_results:
+            top = chosen[:min_results][:top_n]
+        # Normalize scores to 0..1 (same scale as the 相关度阈值 slider) for display.
+        top_norm = [(t, r, round(s / max_score, 3)) for (t, r, s) in top]
+        rows = _build_hybrid_rows(top_norm, lambda t, r: _fetch_row_by_id(conn, t, r))
         return rows, None
     except Exception as exc:  # noqa: BLE001
         return [], f"搜索出错：{exc}"
@@ -297,7 +350,7 @@ def rag_query(
         answer = _llm.answer(
             question,
             context,
-            source="数据库表格：" + "、".join(selected),
+            source=_build_source_label(source_rows),
         )
         return answer, source_rows, None
     except Exception as exc:  # noqa: BLE001
@@ -343,7 +396,7 @@ def rag_query_with_code(
                 for r in source_rows
             )
         )
-        answer = _llm.answer(question, context)
+        answer = _llm.answer(question, context, source=_build_source_label(source_rows))
         return answer, source_rows, code, code_result, None
     except Exception as exc:  # noqa: BLE001
         return "", [], "", "", f"代码解释器出错：{exc}"
@@ -379,7 +432,7 @@ def rag_query_with_review(
                     full.get("__row_text") or json.dumps(_row_display_json(full), ensure_ascii=False)
                 )
         context = "\n".join(context_parts)
-        answer = _llm.answer(question, context)
+        answer = _llm.answer(question, context, source=_build_source_label(source_rows))
         verdict, critique = _llm.review_answer(question, context, answer)
         return answer, source_rows, verdict, critique, None
     except Exception as exc:  # noqa: BLE001
@@ -418,7 +471,7 @@ def rag_query_decomposed(
             all_rows.extend(rows)
         if not all_rows:
             return "", [], "未找到相关的数据行。"
-        final = _llm.answer(question, "\n\n".join(parts))
+        final = _llm.answer(question, "\n\n".join(parts), source=_build_source_label(all_rows))
         return final, all_rows, None
     except Exception as exc:  # noqa: BLE001
         return "", [], f"子查询分解问答出错：{exc}"
@@ -465,6 +518,9 @@ def rag_query_dual(
         if not source_rows and (sql_err or not sql_rows):
             return "", [], sql, sql_context, "未找到相关的数据行。"
         answer = _llm.cross_validate(question, sql_context, text_context)
+        label = _build_source_label(source_rows)
+        if label:
+            answer = f"{answer}\n\n【来源：{label}】"
         return answer, source_rows, sql, sql_context, None
     except Exception as exc:  # noqa: BLE001
         return "", [], "", "", f"SQL+文本交叉验证出错：{exc}"
@@ -725,6 +781,8 @@ def main() -> None:
           query = st.text_input("关键词 / 短语搜索", placeholder="输入要搜索的内容")
           score_floor = st.slider("相关度阈值", min_value=0.0, max_value=1.0, value=0.0, step=0.05,
                                   help="0 = 不筛选，1 = 仅保留最高分结果")
+          min_results = int(st.number_input("最少返回条数", min_value=0, value=5, step=1, key="min_results_hybrid",
+                                              help="默认 5（阈值再高也至少返回 5 条，避免空结果）；0 = 不限制；N = 至少返回 N 条（受显示条数上限约束）"))
           view_mode_label = st.segmented_control("排序方式", options=["按重排分", "按原始混合分"], default="按重排分")
           view_mode = "rerank" if view_mode_label == "按重排分" else "fusion"
           if st.button("搜索", type="primary", icon=":material/search:"):
@@ -737,7 +795,8 @@ def main() -> None:
                   try:
                       use_tables = _search.select_tables(conn, query, k=3) if auto_select else selected
                       rows, err = hybrid_query(conn, use_tables, query, score_floor_frac=score_floor,
-                                               view_mode=view_mode, top_n=top_n, recall_pool=50)
+                                               view_mode=view_mode, top_n=top_n, recall_pool=50,
+                                               min_results=min_results)
                   finally:
                       conn.close()
                   st.session_state.auto_used_tables = use_tables if auto_select else None
@@ -1009,62 +1068,84 @@ def main() -> None:
           st.caption(f"自动选择表：{'、'.join(auto_used)}")
       if result_rows:
           st.subheader("查询结果", divider=False)
-          df_data = [
-              {k: v for k, v in row.items() if not k.startswith("__")}
-              for row in result_rows
-          ]
-          event = st.dataframe(
-              df_data,
-              on_select="rerun",
-              selection_mode="single-row",
-              key="result_df",
-              hide_index=True,
-          )
+          # Group results by source table so each table is shown in its own block.
+          _order = []
+          for r in result_rows:
+              t = r.get("__table")
+              if t is not None and t not in _order:
+                  _order.append(t)
+          groups = {}
+          for r in result_rows:
+              groups.setdefault(r.get("__table"), []).append(r)
+          _order = _order + ([None] if None in groups else [])
 
-          # Row detail
-          sel = event.selection.rows if event and event.selection else []
-          if sel:
-              row = result_rows[sel[0]]
-              table = row.get("__table")
-              rid = row.get("__row_id")
-              if table and rid:
-                  conn = _db.get_conn()
-                  try:
-                      full = _fetch_row_by_id(conn, table, rid)
-                  finally:
-                      conn.close()
-                  if full:
-                      st.subheader("行详情", divider=False)
-                      st.code(
-                          json.dumps(_row_display_json(full), ensure_ascii=False, indent=2, default=str),
-                          language="json",
-                      )
+          for tbl in _order:
+              rows = groups[tbl]
+              # Drop rows with no visible data so empty rows are not shown.
+              visible = [r for r in rows if _row_has_visible_data(r)]
+              if not visible:
+                  continue
+              if tbl is not None:
+                  st.subheader(f"表格：{tbl}", divider=False)
+              df_data = [
+                  {k: v for k, v in row.items() if not k.startswith("__")}
+                  for row in visible
+              ]
+              event = st.dataframe(
+                  df_data,
+                  on_select="rerun",
+                  selection_mode="single-row",
+                  key=f"result_df_{tbl}",
+                  hide_index=True,
+              )
 
-          # CSV download
-          csv_bytes = _to_csv(df_data)
-          st.download_button(
-              "下载 CSV",
-              data=csv_bytes,
-              file_name="result.csv",
-              mime="text/csv",
-              icon=":material/download:",
-          )
+              # Row detail
+              sel = event.selection.rows if event and event.selection else []
+              if sel:
+                  row = visible[sel[0]]
+                  table = row.get("__table")
+                  rid = row.get("__row_id")
+                  if table and rid:
+                      conn = _db.get_conn()
+                      try:
+                          full = _fetch_row_by_id(conn, table, rid)
+                      finally:
+                          conn.close()
+                      if full:
+                          st.subheader("行详情", divider=False)
+                          st.code(
+                              json.dumps(_row_display_json(full), ensure_ascii=False, indent=2, default=str),
+                              language="json",
+                          )
+
+              # CSV download (per table)
+              csv_bytes = _to_csv(df_data)
+              st.download_button(
+                  f"下载 CSV（{tbl}）" if tbl is not None else "下载 CSV",
+                  data=csv_bytes,
+                  file_name=f"result_{tbl}.csv" if tbl is not None else "result.csv",
+                  mime="text/csv",
+                  icon=":material/download:",
+                  key=f"dl_{tbl}",
+              )
 
     # ---- right column: data preview --------------------------------------
     with col_preview:
-      st.subheader("数据预览（前 5 行）", divider=False)
-      if not selected:
-          st.info("请先在上方选择参与搜索的表。")
-      else:
-          conn_pv = _db.get_conn()
-          try:
-              _pv_cols, pv_rows = _db.get_preview(conn_pv, selected[0], n=5)
-          finally:
-              conn_pv.close()
-          if pv_rows:
-              st.dataframe(pv_rows, hide_index=True)
-          else:
-              st.info("该表暂无数据。")
+        st.subheader("数据预览（各表前 5 行）", divider=False)
+        if not selected:
+            st.info("请先在上方选择参与搜索的表。")
+        else:
+            conn_pv = _db.get_conn()
+            try:
+                for tbl in selected:
+                    _pv_cols, pv_rows = _db.get_preview(conn_pv, tbl, n=5)
+                    st.markdown(f"**{tbl}**")
+                    if pv_rows:
+                        st.dataframe(pv_rows, hide_index=True, key=f"preview_{tbl}")
+                    else:
+                        st.info(f"{tbl}：暂无数据。")
+            finally:
+                conn_pv.close()
 
 
 if __name__ == "__main__":

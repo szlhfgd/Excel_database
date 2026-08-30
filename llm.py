@@ -161,7 +161,11 @@ def answer(question: str, context: str, source: str | None = None) -> str:
     model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
     system = RAG_SYSTEM_PROMPT + "\n\n【参考上下文】\n" + context + "\n【/参考上下文】"
     if source:
-        system += f"\n\n本次回答的信息来源为：{source}。请在回答末尾另起一行标注：【来源：{source}】。"
+        system += (
+            f"\n\n本次回答的信息来源为：{source}。"
+            f"请在回答末尾另起一行原样标注：【来源：{source}】，"
+            f"不要删减其中的表名与行号。"
+        )
     resp = _client().chat.completions.create(
         model=model,
         messages=[
