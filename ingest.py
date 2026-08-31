@@ -102,27 +102,41 @@ def ingest_file(conn: db.sqlite3.Connection, path: str, on_progress=None, name: 
     df["sheet"] = sheet_name
     prog(0.10, "文件读取完成")
     texts = row_texts_for_df(df)
-    if updated and key_col and mode in ("update", "merge"):
-        changed, deleted = db.upsert_rows(conn, name, df, texts, key_col, mode, sheet=sheet_name)
-        if changed:
-            embed_texts = [_search_text_for_row(r, SEARCH_COLS) for _, r in changed]
-            vectors = llm.embed(embed_texts)
-            for (rid, _), vec in zip(changed, vectors):
-                db.replace_vec(conn, name, rid, vec)
-        if deleted:
-            db.delete_vec_rows(conn, name, deleted)
-        prog(1.0, "导入完成")
-        return name, True
-    if updated:
-        db.delete_table(conn, name)
-    db.create_table_from_df(conn, name, df, texts, sheet=sheet_name)
-    prog(0.30, "已建表，开始生成向量…")
-    build_embeddings(conn, name, on_progress=prog)
+
+    # The data-table writes and the companion vector writes must be atomic:
+    # any failure partway leaves no "table without vectors" (or stale) state.
+    # Python's sqlite3 legacy mode auto-begins a transaction only before DML,
+    # so CREATE/DROP TABLE would otherwise commit immediately and defeat the
+    # rollback. Begin an explicit transaction and roll back on any error so the
+    # whole import is all-or-nothing.
+    conn.execute("BEGIN")
+    try:
+        if updated and key_col and mode in ("update", "merge"):
+            changed, deleted = db.upsert_rows(conn, name, df, texts, key_col, mode, sheet=sheet_name, commit=False)
+            if changed:
+                embed_texts = [_search_text_for_row(r, SEARCH_COLS) for _, r in changed]
+                vectors = llm.embed(embed_texts)
+                for (rid, _), vec in zip(changed, vectors):
+                    db.replace_vec(conn, name, rid, vec, commit=False)
+            if deleted:
+                db.delete_vec_rows(conn, name, deleted, commit=False)
+            conn.commit()
+            prog(1.0, "导入完成")
+            return name, True
+        if updated:
+            db.delete_table(conn, name, commit=False)
+        db.create_table_from_df(conn, name, df, texts, sheet=sheet_name, commit=False)
+        prog(0.30, "已建表，开始生成向量…")
+        build_embeddings(conn, name, on_progress=prog, commit=False)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
     prog(1.0, "导入完成")
     return name, updated
 
 
-def build_embeddings(conn: db.sqlite3.Connection, name: str, on_progress=None) -> None:
+def build_embeddings(conn: db.sqlite3.Connection, name: str, on_progress=None, commit: bool = True) -> None:
     rows = db.get_rows(conn, name)
     if not rows:
         return
@@ -138,5 +152,5 @@ def build_embeddings(conn: db.sqlite3.Connection, name: str, on_progress=None) -
         if on_progress:
             frac = 0.30 + (done / n) * 0.60
             on_progress(frac, f"生成向量 {done}/{n}")
-    db.create_vec_table(conn, name)
-    db.upsert_embeddings(conn, name, [r["row_id"] for r in rows], vectors)
+    db.create_vec_table(conn, name, commit=commit)
+    db.upsert_embeddings(conn, name, [r["row_id"] for r in rows], vectors, commit=commit)

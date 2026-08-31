@@ -20,12 +20,39 @@ def _client() -> OpenAI:
 MAX_EMBED_CHARS = int(os.environ.get("EMBED_MAX_CHARS", "4000"))
 
 
+def _truncate_token_safe(text: str) -> str:
+    """Truncate *text* to ``MAX_EMBED_CHARS`` at a token (word) boundary.
+
+    A naive ``text[:N]`` can slice mid-word / mid-sentence, degrading the
+    embedding of the trailing fragment. For typical short row text (well under
+    the limit) this returns the input untouched and costs nothing; only
+    over-limit text pay for the jieba tokenization, which lets us stop at a
+    whole-word boundary instead of splitting a word in half.
+    """
+    if len(text) <= MAX_EMBED_CHARS:
+        return text
+    import jieba
+
+    tokens = jieba.lcut_for_search(text)
+    out = ""
+    for tok in tokens:
+        if len(out) + len(tok) > MAX_EMBED_CHARS:
+            break
+        out += tok
+    # jieba may over-split in ways that still leave a dangling char, so never
+    # return something oddly short; fall back to a clean prefix if needed.
+    if not out:
+        out = text[:MAX_EMBED_CHARS]
+    return out.strip()
+
+
 def _sanitize_embed_inputs(texts: list) -> list[str]:
     """Coerce embed inputs to safe strings and truncate to ``MAX_EMBED_CHARS``.
 
     The API returns code 20015 ("parameter invalid") for non-string elements
     (None / float) and for inputs that exceed the model's token limit, so every
     element is normalized to a string and capped in length before being sent.
+    Truncation is token-aware (:func:`_truncate_token_safe`).
     """
     cleaned: list[str] = []
     for t in texts:
@@ -35,7 +62,7 @@ def _sanitize_embed_inputs(texts: list) -> list[str]:
             cleaned.append(str(t))
         else:
             cleaned.append(t)
-    return [t[:MAX_EMBED_CHARS] for t in cleaned]
+    return [_truncate_token_safe(t) for t in cleaned]
 
 
 def embed(texts: list[str]) -> list[list[float]]:
@@ -77,7 +104,10 @@ def generate_sql(table_schemas: list[dict], query: str, prev_error: str | None =
     schema_block = "\n\n".join(_render_schema(s) for s in table_schemas)
     system = (
         "你是一个 SQLite 专家。根据用户自然语言问题，只输出一条可在 SQLite 执行的 SQL，"
-        "不要解释，不要 markdown 代码块，只输出 SQL 本身。\n可用表结构：\n" + schema_block
+        "不要解释，不要 markdown 代码块，只输出 SQL 本身。\n"
+        "硬性约束：只允许生成只读查询（SELECT / WITH / VALUES），严禁任何写操作"
+        "（DELETE、UPDATE、DROP、INSERT、ALTER、CREATE、REPLACE、ATTACH、VACUUM）"
+        "或多语句（分号分隔）。\n可用表结构：\n" + schema_block
     )
     user_msg = query
     if prev_error:
@@ -151,6 +181,10 @@ RAG_SYSTEM_PROMPT = """你是一名知识库问答助手，请严格依据【参
 6. 不要在回答正文里提及"参考上下文、知识库、文档"这类字眼；
 7. 如果用户问题和上下文无关，直接告知无法解答。"""
 
+# Max prior conversation turns injected into the streaming answer call. 10 turns
+# bounds token usage for multi-turn chat while keeping conversational context.
+MAX_HISTORY_TURNS = int(os.environ.get("RAG_MAX_HISTORY_TURNS", "10"))
+
 
 def answer(question: str, context: str, source: str | None = None) -> str:
     """Answer *question* in natural language, grounded in *context* (retrieved rows).
@@ -175,6 +209,38 @@ def answer(question: str, context: str, source: str | None = None) -> str:
         temperature=0.0,
     )
     return resp.choices[0].message.content.strip()
+
+
+def answer_stream(question: str, context: str, source: str | None = None, history: list[dict] | None = None):
+    """Streaming variant of :func:`answer`. Yields the answer in text chunks.
+    *history* is an optional list of prior ``{"role": "user"|"assistant",
+    "content": ...}`` turns for multi-turn conversation. The current turn's
+    retrieved *context* is injected for this question only; prior turns are
+    sent as conversation history without their (now stale) contexts. History is
+    capped to ``MAX_HISTORY_TURNS`` to bound token usage.
+    """
+    model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
+    system = RAG_SYSTEM_PROMPT + "\n\n【参考上下文】\n" + context + "\n【/参考上下文】"
+    if source:
+        system += (
+            f"\n\n本次回答的信息来源为：{source}。"
+            f"请在回答末尾另起一行原样标注：【来源：{source}】，"
+            f"不要删减其中的表名与行号。"
+        )
+    messages: list[dict] = [{"role": "system", "content": system}]
+    if history:
+        messages.extend(history[-MAX_HISTORY_TURNS:])
+    messages.append({"role": "user", "content": question})
+    stream = _client().chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.0,
+        stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content if chunk.choices else None
+        if delta:
+            yield delta
 
 
 def rerank(query: str, documents: list[str], top_n: int | None = None) -> list[float]:

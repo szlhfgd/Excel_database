@@ -54,8 +54,7 @@ def test_run_query_returns_columns_and_rows():
 
 def test_run_query_no_result_returns_empty():
     conn = sqlite3.connect(":memory:")
-    cols, rows = app._run_query(conn, "CREATE TABLE t (a INT)")
-    assert cols == []
+    cols, rows = app._run_query(conn, "SELECT * FROM sqlite_master WHERE name='__never__'")
     assert rows == []
 
 
@@ -511,6 +510,62 @@ def test_rag_query_error_surfaces(monkeypatch):
     assert answer == ""
     assert rows == []
     assert err is not None and "RAG" in err
+
+
+def test_rag_query_stream_yields_answer_and_threads_history(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
+    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
+    monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
+    captured = {}
+
+    def fake_answer_stream(question, context, source=None, history=None):
+        captured["history"] = history
+        captured["source"] = source
+        yield "流式"
+        yield "答案"
+
+    monkeypatch.setattr(llm_mod, "answer_stream", fake_answer_stream)
+    history = [{"role": "user", "content": "上一问"}]
+    out_rows: list = []
+    out = "".join(app.rag_query_stream(None, ["t"], "q", history=history, out_rows=out_rows))
+    assert out == "流式答案"
+    assert captured["history"] == history
+    assert captured["source"] == "数据库表格：t（行 1）"
+    assert out_rows and out_rows[0]["__table"] == "t"
+
+
+def test_rag_query_stream_no_rows_web_fallback(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [])
+    captured = {}
+
+    def fake_answer_stream(question, context, source=None, history=None):
+        captured["source"] = source
+        yield "网络答案"
+
+    monkeypatch.setattr(llm_mod, "answer_stream", fake_answer_stream)
+    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("网络搜索结果文本", None))
+    out_rows: list = []
+    out = "".join(app.rag_query_stream(None, ["t"], "q", out_rows=out_rows))
+    assert out == "网络答案"
+    assert captured["source"] == "网络搜索（AnySearch）"
+    assert out_rows == []
+
+
+def test_rag_query_stream_web_search_fails_yields_error(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
+    monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [])
+    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("", "网络搜索失败：超时"))
+    out = "".join(app.rag_query_stream(None, ["t"], "q"))
+    assert "网络搜索" in out
+
+
+def test_rag_query_stream_error_yields_single_message(monkeypatch):
+    monkeypatch.setattr(llm_mod, "embed", lambda texts: (_ for _ in ()).throw(RuntimeError("embed down")))
+    out = "".join(app.rag_query_stream(None, ["t"], "q"))
+    assert "RAG 问答出错" in out
 
 
 def test_rag_query_with_code_runs(monkeypatch):

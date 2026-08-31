@@ -39,6 +39,26 @@ def get_conn() -> sqlite3.Connection:
     return conn
 
 
+def get_readonly_conn() -> sqlite3.Connection:
+    """Return a read-only connection suitable for query (SELECT/NL2SQL) paths.
+
+    Enforces read-only at the database layer (``query_only`` PRAGMA) on top of
+    the :func:`execute_sql.assert_readonly_sql` statement guard, so even if a
+    destructive statement slips past validation it cannot mutate data. For
+    in-memory databases (tests) we fall back to a normal connection plus the
+    PRAGMA, since a URI cannot open ``:memory:`` read-only.
+    """
+    if DB_PATH == ":memory:":
+        conn = sqlite3.connect(DB_PATH)
+    else:
+        conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    conn.enable_load_extension(True)
+    sqlite_vec.load(conn)
+    conn.execute("PRAGMA query_only = ON")
+    return conn
+
+
 def list_tables(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE ?",
@@ -62,7 +82,7 @@ def _sql_type(dtype: str) -> str:
     return "TEXT"
 
 
-def create_table_from_df(conn: sqlite3.Connection, name: str, df, row_texts: list[str], sheet: str | None = None) -> str:
+def create_table_from_df(conn: sqlite3.Connection, name: str, df, row_texts: list[str], sheet: str | None = None, commit: bool = True) -> str:
     df = df.copy()
     if sheet is not None and "sheet" not in df.columns:
         df["sheet"] = sheet
@@ -88,7 +108,8 @@ def create_table_from_df(conn: sqlite3.Connection, name: str, df, row_texts: lis
         placeholders = ", ".join(["?"] * (len(cols) + 1))
         quoted = ", ".join(f'"{cname}"' for _, cname, _ in cols)
         conn.execute(f'INSERT INTO "{safe}" (__row_text, {quoted}) VALUES ({placeholders})', values)
-    conn.commit()
+    if commit:
+        conn.commit()
     return safe
 
 
@@ -143,10 +164,11 @@ def get_row_coords(conn: sqlite3.Connection, name: str, row_id: int) -> list[tup
     return out
 
 
-def delete_table(conn: sqlite3.Connection, name: str) -> None:
+def delete_table(conn: sqlite3.Connection, name: str, commit: bool = True) -> None:
     conn.execute(f'DROP TABLE IF EXISTS "{name}"')
     conn.execute(f'DROP TABLE IF EXISTS "{VEC_PREFIX}{name}"')
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def get_schema(conn: sqlite3.Connection, name: str) -> dict:
@@ -265,19 +287,21 @@ def _normalize(v: list[float]) -> list[float]:
     return [x / norm for x in v] if norm else v
 
 
-def create_vec_table(conn: sqlite3.Connection, name: str) -> None:
+def create_vec_table(conn: sqlite3.Connection, name: str, commit: bool = True) -> None:
     vname = VEC_PREFIX + name
     conn.execute(f'DROP TABLE IF EXISTS "{vname}"')
     conn.execute(f'CREATE VIRTUAL TABLE "{vname}" USING vec0(embedding float[{EMBED_DIM}])')
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def upsert_embeddings(conn: sqlite3.Connection, name: str, row_ids: list[int], vectors: list[list[float]]) -> None:
+def upsert_embeddings(conn: sqlite3.Connection, name: str, row_ids: list[int], vectors: list[list[float]], commit: bool = True) -> None:
     vname = VEC_PREFIX + name
     for rid, vec in zip(row_ids, vectors):
         blob = sqlite_vec.serialize_float32(_normalize(vec))
         conn.execute(f'INSERT INTO "{vname}" (rowid, embedding) VALUES (?, ?)', (rid, blob))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def vec_search(conn: sqlite3.Connection, name: str, query_vec: list[float], k: int | None = None) -> list[tuple[int, float]]:
@@ -290,23 +314,25 @@ def vec_search(conn: sqlite3.Connection, name: str, query_vec: list[float], k: i
     return [(r["rowid"], r["distance"]) for r in rows]
 
 
-def replace_vec(conn: sqlite3.Connection, name: str, row_id: int, vec: list[float]) -> None:
+def replace_vec(conn: sqlite3.Connection, name: str, row_id: int, vec: list[float], commit: bool = True) -> None:
     """Replace the vector for a single row (delete + insert)."""
     vname = VEC_PREFIX + name
     blob = sqlite_vec.serialize_float32(_normalize(vec))
     conn.execute(f'DELETE FROM "{vname}" WHERE rowid=?', (row_id,))
     conn.execute(f'INSERT INTO "{vname}" (rowid, embedding) VALUES (?, ?)', (row_id, blob))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def delete_vec_rows(conn: sqlite3.Connection, name: str, row_ids: list[int]) -> None:
+def delete_vec_rows(conn: sqlite3.Connection, name: str, row_ids: list[int], commit: bool = True) -> None:
     vname = VEC_PREFIX + name
     for rid in row_ids:
         conn.execute(f'DELETE FROM "{vname}" WHERE rowid=?', (rid,))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def upsert_rows(conn: sqlite3.Connection, name: str, df, row_texts: list[str], key_col: str, mode: str, sheet: str | None = None) -> tuple[list[tuple[int, dict]], list[int]]:
+def upsert_rows(conn: sqlite3.Connection, name: str, df, row_texts: list[str], key_col: str, mode: str, sheet: str | None = None, commit: bool = True) -> tuple[list[tuple[int, dict]], list[int]]:
     df = df.copy()
     if sheet is not None and "sheet" not in df.columns:
         df["sheet"] = sheet
@@ -369,5 +395,6 @@ def upsert_rows(conn: sqlite3.Connection, name: str, df, row_texts: list[str], k
                 deleted.append(rid)
                 conn.execute(f'DELETE FROM "{safe}" WHERE row_id=?', (rid,))
 
-    conn.commit()
+    if commit:
+        conn.commit()
     return changed, deleted

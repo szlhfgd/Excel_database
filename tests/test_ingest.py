@@ -250,3 +250,28 @@ def test_build_embeddings_embeds_search_text_not_row_text():
         with mock.patch.object(ingest, "SEARCH_COLS", ["desc"]):
             ingest.build_embeddings(conn, name)
     assert captured == ["desc: 这是一段很长的描述文本用于向量化测试"]
+
+
+def test_ingest_rolls_back_table_and_vec_on_embed_failure():
+    # If vector generation fails partway, the whole import (data table +
+    # vector table) must roll back atomically — no table-without-vectors.
+    conn = db.get_conn()
+    name = "atomic_" + uuid.uuid4().hex[:8]
+    df = pd.DataFrame({"c": [f"row {i}" for i in range(70)]})
+    p = os.path.join(os.environ.get("TMP", "."), name + ".csv")
+    _write_csv(p, df)
+
+    calls = {"n": 0}
+
+    def boom(batch):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("network down")
+        return [[0.0] * db.EMBED_DIM for _ in batch]
+
+    with mock.patch.object(llm_mod(), "embed", side_effect=boom):
+        with pytest.raises(RuntimeError):
+            ingest.ingest_file(conn, p)
+
+    assert name not in db.list_tables(conn)
+    assert ("vec_" + name) not in db.list_tables(conn)

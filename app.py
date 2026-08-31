@@ -81,7 +81,14 @@ def _to_csv(records: Any) -> bytes:
 
 
 def _run_query(conn: sqlite3.Connection, sql: str) -> tuple[list[str], list[dict]]:
-    """Execute *sql* and return ``(columns, rows_as_dicts)``."""
+    """Execute *sql* and return ``(columns, rows_as_dicts)``.
+
+    Guards against destructive / non-read-only statements via
+    :func:`execute_sql.assert_readonly_sql` before execution.
+    """
+    from execute_sql import assert_readonly_sql
+
+    assert_readonly_sql(sql)
     cur = conn.execute(sql)
     if cur.description is None:
         return [], []
@@ -355,6 +362,78 @@ def rag_query(
         return answer, source_rows, None
     except Exception as exc:  # noqa: BLE001
         return "", [], f"RAG 问答出错：{exc}"
+
+
+def rag_query_stream(
+    conn: sqlite3.Connection,
+    selected: list[str],
+    question: str,
+    history: list[dict] | None = None,
+    recall_pool: int = 50,
+    top_n: int = 5,
+    out_rows: list | None = None,
+):
+    """Generator variant of :func:`rag_query` for streaming output.
+
+    Retrieval (embed → hybrid search → rerank → can_answer → web fallback) is
+    blocking and happens on first :func:`next`; it yields the final answer in
+    text chunks via :func:`llm.answer_stream`. *history* is a list of prior
+    ``{"role", "content"}`` turns for multi-turn conversation. When *out_rows*
+    (a list) is supplied, the retrieved ``source_rows`` are appended to it so
+    callers can display them alongside the streamed answer.
+
+    To keep the UI uniformly streaming, errors / empty results are yielded as a
+    single message rather than raised.
+    """
+    import llm as _llm
+    import search as _search
+
+    try:
+        vec = _llm.embed([question])[0]
+        results = _search.hybrid_search(conn, selected, question, vec, recall_pool=recall_pool)
+        top = _rerank_results(conn, question, results, top_n=top_n)
+        source_rows = _build_hybrid_rows(top, lambda t, r: _fetch_row_by_id(conn, t, r))
+        if out_rows is not None:
+            out_rows.clear()
+            out_rows.extend(source_rows)
+        context_parts: list[str] = []
+        for row in source_rows:
+            full = _fetch_row_by_id(conn, row["__table"], row["__row_id"])
+            if full:
+                context_parts.append(full.get("__row_text") or json.dumps(_row_display_json(full), ensure_ascii=False))
+        if not source_rows:
+            import websearch as _web
+
+            web_text, web_err = _web.search(question, max_results=5)
+            if web_err:
+                yield f"RAG 问答出错：{web_err}"
+                return
+            if not web_text:
+                yield "未找到相关的数据行，且网络搜索无结果。"
+                return
+            yield from _llm.answer_stream(question, web_text, source="网络搜索（AnySearch）", history=history)
+            return
+        context = "\n".join(context_parts)
+        if not _llm.can_answer(question, context):
+            import websearch as _web
+
+            web_text, web_err = _web.search(question, max_results=5)
+            if web_err:
+                yield f"RAG 问答出错：{web_err}"
+                return
+            if not web_text:
+                yield "未找到相关的数据行，且网络搜索无结果。"
+                return
+            yield from _llm.answer_stream(question, web_text, source="网络搜索（AnySearch）", history=history)
+            return
+        yield from _llm.answer_stream(
+            question,
+            context,
+            source=_build_source_label(source_rows),
+            history=history,
+        )
+    except Exception as exc:  # noqa: BLE001
+        yield f"RAG 问答出错：{exc}"
 
 
 _INTERNAL_COLS = {"__table", "__row_id", "sheet", "src_row"}
@@ -637,6 +716,8 @@ def main() -> None:
         st.session_state.show_detail_row = None
     if "rag_answer" not in st.session_state:
         st.session_state.rag_answer = None
+    if "rag_messages" not in st.session_state:
+        st.session_state.rag_messages = []  # list[{"role", "content"}]
     if "rag_dual_sql" not in st.session_state:
         st.session_state.rag_dual_sql = None
     if "rag_dual_ctx" not in st.session_state:
@@ -834,7 +915,7 @@ def main() -> None:
               elif not selected and not auto_select:
                   st.warning("请先在上方选择至少一个参与查询的表，或开启自动选择表。")
               else:
-                  conn = _db.get_conn()
+                  conn = _db.get_readonly_conn()
                   try:
                       use_tables = _search.select_tables(conn, question, k=3) if auto_select else selected
                       sql, cols, rows, err = ask_query(conn, use_tables, question)
@@ -866,7 +947,7 @@ def main() -> None:
               if not sql_input or not sql_input.strip():
                   st.warning("请输入 SQL 语句。")
               else:
-                  conn = _db.get_conn()
+                  conn = _db.get_readonly_conn()
                   try:
                       cols, rows, err = sql_query(conn, sql_input)
                   finally:
@@ -887,7 +968,6 @@ def main() -> None:
 
       # -- rag mode -----------------------------------------------------------
       elif mode == "rag":
-          question = st.text_area("用自然语言提问（基于数据库内容回答）", placeholder="例如：哪些客户的金额超过 100？", height=80)
           use_code_interpreter = st.toggle("启用代码解释器", key="rag_use_code")
           use_decompose = st.toggle(
               "启用子查询分解",
@@ -899,70 +979,119 @@ def main() -> None:
               key="rag_dual",
               help="同时用 SQL 和文本检索回答，交叉验证冲突。与子查询分解互斥，分解优先。",
           )
-          if st.button("问答", type="primary", icon=":material/chat:"):
-              if not question or not question.strip():
-                  st.warning("请输入问题。")
-              elif not selected and not auto_select:
-                  st.warning("请先在上方选择至少一个参与查询的表，或开启自动选择表。")
-              else:
-                  conn = _db.get_conn()
-                  try:
-                      use_tables = _search.select_tables(conn, question, k=3) if auto_select else selected
-                      if use_decompose:
-                          answer_text, rows, err = rag_query_decomposed(conn, use_tables, question, top_n=top_n)
-                          st.session_state.rag_code = None
-                          st.session_state.rag_code_result = None
-                          st.session_state.rag_dual_sql = None
-                          st.session_state.rag_dual_ctx = None
-                      elif use_dual:
-                          answer_text, rows, sql_str, sql_ctx, err = rag_query_dual(conn, use_tables, question, top_n=top_n)
-                          st.session_state.rag_code = None
-                          st.session_state.rag_code_result = None
-                          st.session_state.rag_dual_sql = sql_str
-                          st.session_state.rag_dual_ctx = sql_ctx
-                      elif use_code_interpreter:
-                          answer_text, rows, code, code_result, err = rag_query_with_code(conn, use_tables, question, top_n=top_n)
-                          st.session_state.rag_code = code
-                          st.session_state.rag_code_result = code_result
-                          st.session_state.rag_dual_sql = None
-                          st.session_state.rag_dual_ctx = None
-                      else:
-                          answer_text, rows, err = rag_query(conn, use_tables, question, top_n=top_n)
-                          st.session_state.rag_code = None
-                          st.session_state.rag_code_result = None
-                          st.session_state.rag_dual_sql = None
-                          st.session_state.rag_dual_ctx = None
-                  finally:
-                      conn.close()
-                  st.session_state.auto_used_tables = use_tables if auto_select else None
-                  if err:
-                      st.error(err)
+          # 多轮对话（流式输出）仅用于纯 rag_query 路径；分解/交叉验证/代码
+          # 解释器为分阶段多调用，继续使用原有的单轮非流式交互。
+          use_legacy = use_decompose or use_dual or use_code_interpreter
+
+          if use_legacy:
+              question = st.text_area("用自然语言提问（基于数据库内容回答）", placeholder="例如：哪些客户的金额超过 100？", height=80)
+              if st.button("问答", type="primary", icon=":material/chat:"):
+                  if not question or not question.strip():
+                      st.warning("请输入问题。")
+                  elif not selected and not auto_select:
+                      st.warning("请先在上方选择至少一个参与查询的表，或开启自动选择表。")
                   else:
-                      st.session_state.rag_answer = answer_text
-                      if not rows:
-                          st.info("未找到相关的数据行。")
-                          st.session_state.result_rows = []
+                      conn = _db.get_readonly_conn()
+                      try:
+                          use_tables = _search.select_tables(conn, question, k=3) if auto_select else selected
+                          if use_decompose:
+                              answer_text, rows, err = rag_query_decomposed(conn, use_tables, question, top_n=top_n)
+                              st.session_state.rag_code = None
+                              st.session_state.rag_code_result = None
+                              st.session_state.rag_dual_sql = None
+                              st.session_state.rag_dual_ctx = None
+                          elif use_dual:
+                              answer_text, rows, sql_str, sql_ctx, err = rag_query_dual(conn, use_tables, question, top_n=top_n)
+                              st.session_state.rag_code = None
+                              st.session_state.rag_code_result = None
+                              st.session_state.rag_dual_sql = sql_str
+                              st.session_state.rag_dual_ctx = sql_ctx
+                          elif use_code_interpreter:
+                              answer_text, rows, code, code_result, err = rag_query_with_code(conn, use_tables, question, top_n=top_n)
+                              st.session_state.rag_code = code
+                              st.session_state.rag_code_result = code_result
+                              st.session_state.rag_dual_sql = None
+                              st.session_state.rag_dual_ctx = None
+                          else:
+                              answer_text, rows, err = rag_query(conn, use_tables, question, top_n=top_n)
+                              st.session_state.rag_code = None
+                              st.session_state.rag_code_result = None
+                              st.session_state.rag_dual_sql = None
+                              st.session_state.rag_dual_ctx = None
+                      finally:
+                          conn.close()
+                      st.session_state.auto_used_tables = use_tables if auto_select else None
+                      if err:
+                          st.error(err)
                       else:
-                          st.session_state.result_rows = rows
+                          st.session_state.rag_answer = answer_text
+                          st.session_state.rag_messages = []  # 非流式子模式不走多轮对话
+                          if not rows:
+                              st.info("未找到相关的数据行。")
+                              st.session_state.result_rows = []
+                          else:
+                              st.session_state.result_rows = rows
+                          st.session_state.result_mode = "rag"
+                          st.session_state.ask_sql = None
+                          st.session_state.show_detail_row = None
+                          result_rows = st.session_state.result_rows
+                          result_mode = "rag"
+
+              if st.session_state.get("rag_answer"):
+                  st.info(st.session_state.rag_answer, icon=":material/chat:")
+
+              if st.session_state.get("rag_code"):
+                  st.markdown("**生成的计算代码**")
+                  st.code(st.session_state.rag_code, language="python")
+                  st.markdown("**代码执行结果**")
+                  st.code(st.session_state.rag_code_result)
+
+              if st.session_state.get("rag_dual_sql"):
+                  with st.expander("SQL 执行结果"):
+                      st.code(st.session_state.rag_dual_sql, language="sql")
+                      st.code(st.session_state.rag_dual_ctx)
+          else:
+              # ---- 纯智能问答：多轮会话 + 流式输出 ----
+              if st.button("清空对话", icon=":material/delete_sweep:", help="清除当前会话的历史问答记录"):
+                  st.session_state.rag_messages = []
+                  st.session_state.rag_answer = None
+                  st.session_state.result_rows = []
+                  st.session_state.result_mode = None
+                  st.rerun()
+
+              # 渲染历史对话
+              for msg in st.session_state.rag_messages:
+                  with st.chat_message(msg["role"]):
+                      st.markdown(msg["content"])
+
+              prompt = st.chat_input("输入问题（基于数据库内容回答）…")
+              if prompt:
+                  if not selected and not auto_select:
+                      st.warning("请先在上方选择至少一个参与查询的表，或开启自动选择表。")
+                  else:
+                      st.chat_message("user").markdown(prompt)
+                      st.session_state.rag_messages.append({"role": "user", "content": prompt})
+                      history = list(st.session_state.rag_messages)  # 已在 llm.answer_stream 内裁剪到上限
+                      st.session_state.auto_used_tables = None
+                      conn = _db.get_readonly_conn()
+                      _out_rows: list = []
+                      try:
+                          with st.chat_message("assistant"):
+                              with st.spinner("检索中…"):
+                                  use_tables = _search.select_tables(conn, prompt, k=3) if auto_select else selected
+                              st.session_state.auto_used_tables = use_tables if auto_select else None
+                              # 首次迭代会执行阻塞检索（填充 _out_rows），随后流式输出最终答案。
+                              answer_text = st.write_stream(
+                                  rag_query_stream(conn, use_tables, prompt, history=history, top_n=top_n, out_rows=_out_rows)
+                              )
+                      finally:
+                          conn.close()
+                      st.session_state.rag_answer = answer_text
+                      st.session_state.rag_messages.append({"role": "assistant", "content": answer_text})
+                      st.session_state.result_rows = _out_rows
                       st.session_state.result_mode = "rag"
                       st.session_state.ask_sql = None
                       st.session_state.show_detail_row = None
-                      result_rows = st.session_state.result_rows
-                      result_mode = "rag"
-
-          if st.session_state.get("rag_answer"):
-              st.info(st.session_state.rag_answer, icon=":material/chat:")
-
-          if st.session_state.get("rag_code"):
-              st.markdown("**生成的计算代码**")
-              st.code(st.session_state.rag_code, language="python")
-              st.markdown("**代码执行结果**")
-              st.code(st.session_state.rag_code_result)
-
-          if st.session_state.get("rag_dual_sql"):
-              with st.expander("SQL 执行结果"):
-                  st.code(st.session_state.rag_dual_sql, language="sql")
-                  st.code(st.session_state.rag_dual_ctx)
 
       # -- stats mode --------------------------------------------------------
       elif mode == "统计":

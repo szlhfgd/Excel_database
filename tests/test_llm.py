@@ -131,6 +131,30 @@ def test_embed_sanitizes_and_truncates_inputs():
     assert captured["input"] == cleaned
 
 
+def test_truncate_token_safe_keeps_short_text_unchanged():
+    # Below the limit: no tokenization, input returned untouched.
+    body = "短文本" * 10
+    assert llm._truncate_token_safe(body) == body
+
+
+def test_truncate_token_safe_short_text_is_plain_prefix():
+    # A long run of one char cannot be cut mid-"word"; the hard prefix is a
+    # safe fallback that never exceeds the limit.
+    long_text = "x" * (llm.MAX_EMBED_CHARS + 50)
+    out = llm._truncate_token_safe(long_text)
+    assert len(out) <= llm.MAX_EMBED_CHARS
+
+
+def test_truncate_token_safe_ends_at_word_boundary():
+    # CJK tokenization lets us stop at a whole-word boundary instead of
+    # slicing a sentence mid-word.
+    base = "".join(f"词语{i:03d}" for i in range(500))  # clearly over the limit
+    truncated = llm._truncate_token_safe(base)
+    assert len(truncated) <= llm.MAX_EMBED_CHARS
+    # Should be a strict prefix of the token stream (no split token tail).
+    assert base.startswith(truncated) or truncated == ""
+
+
 def test_generate_sql_strips_trailing_semicolon_and_temperature_zero():
     captured = {}
 
@@ -193,6 +217,129 @@ def test_answer_uses_context_and_returns_content():
     assert "问题" in msgs[1]["content"]
     assert captured["temperature"] == 0.0
 
+
+def test_answer_stream_yields_concatenated_chunks():
+    import types
+    from unittest import mock
+
+    captured = {}
+
+    class FakeDelta:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeChunk:
+        def __init__(self, content):
+            self.choices = [types.SimpleNamespace(delta=FakeDelta(content))]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            assert kwargs.get("stream") is True
+            return iter([FakeChunk("你"), FakeChunk("好"), FakeChunk("！")])
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        out = "".join(llm.answer_stream("问题", "上下文资料"))
+    assert out == "你好！"
+    msgs = captured["messages"]
+    assert "上下文资料" in msgs[0]["content"]
+    assert msgs[1]["role"] == "user" and msgs[1]["content"] == "问题"
+
+
+def test_answer_stream_skips_none_delta():
+    import types
+    from unittest import mock
+
+    class FakeDelta:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeChunk:
+        def __init__(self, content):
+            self.choices = [types.SimpleNamespace(delta=FakeDelta(content))]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            # First chunk has delta.content=None (e.g. role-only chunk) → must be skipped.
+            return iter([FakeChunk(None), FakeChunk("答"), FakeChunk(None), FakeChunk("案")])
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        out = "".join(llm.answer_stream("问题", "上下文资料"))
+    assert out == "答案"
+
+
+def test_answer_stream_injects_history_before_user_question():
+    import types
+    from unittest import mock
+
+    captured = {}
+
+    class FakeDelta:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeChunk:
+        def __init__(self, content):
+            self.choices = [types.SimpleNamespace(delta=FakeDelta(content))]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return iter([FakeChunk("回")])
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    history = [
+        {"role": "user", "content": "上一问"},
+        {"role": "assistant", "content": "上一答"},
+    ]
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        list(llm.answer_stream("当前问题", "上下文资料", history=history))
+    msgs = captured["messages"]
+    assert msgs[0]["role"] == "system"
+    assert msgs[1] == {"role": "user", "content": "上一问"}
+    assert msgs[2] == {"role": "assistant", "content": "上一答"}
+    assert msgs[3] == {"role": "user", "content": "当前问题"}
+
+
+def test_answer_stream_caps_history_turns():
+    import types
+    from unittest import mock
+
+    captured = {}
+
+    class FakeDelta:
+        def __init__(self, content):
+            self.content = content
+
+    class FakeChunk:
+        def __init__(self, content):
+            self.choices = [types.SimpleNamespace(delta=FakeDelta(content))]
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return iter([FakeChunk("x")])
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    # 25 turns → capped to the most recent MAX_HISTORY_TURNS (10).
+    history = [{"role": "user", "content": f"t{i}"} for i in range(25)]
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        list(llm.answer_stream("q", "ctx", history=history))
+    msgs = captured["messages"]
+    # msgs = [system] + capped_history + [current user]
+    assert len(msgs) == 1 + llm.MAX_HISTORY_TURNS + 1
+    assert msgs[1]["content"] == "t15"  # newest 10 of 25 → t15..t24
+    assert msgs[-1]["content"] == "q"
 
 def test_rerank_returns_scores_in_document_order():
     import json
