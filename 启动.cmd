@@ -1,1 +1,1 @@
-D:\pywork\database\.venv\Scripts\streamlit.exe run app.py
+E:\24_PyWork_env\StrutData_db\.venv\Scripts\streamlit.exe run app.py
