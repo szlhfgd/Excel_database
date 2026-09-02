@@ -1,5 +1,5 @@
 import pandas as pd
-import db
+from src.data import db
 
 
 def test_col_letter():

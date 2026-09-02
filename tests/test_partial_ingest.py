@@ -5,9 +5,9 @@ import uuid
 import pytest
 
 import pandas as pd
-import db
-import ingest
-import llm
+from src.data import db
+from src.services import ingest
+from src.ai import llm
 
 
 def _seed(conn, name, keys, vals):

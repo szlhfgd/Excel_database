@@ -1,7 +1,7 @@
 import uuid
 
 import pandas as pd
-import db
+from src.data import db
 
 
 def _df(keys, vals):

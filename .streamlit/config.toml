@@ -1,57 +1,95 @@
 # 电子表格数据库 — 主题配置
-# 设计原则（creating-streamlit-themes）：中性底 + 一个品牌色（蓝），Inter 字体，8px 圆角
-# 改 primaryColor / 字体即可整体换肤，无需改任何 Python 代码
+# 设计：明亮彩度主题 —— 品牌靛蓝 + 靛蓝侧栏 + 高彩度图表/语义色板
+# 全部颜色均在本文件调整，无需改动任何 Python 代码
 
 [theme]
 base = "light"
-primaryColor = "#2563EB"                      # 按钮/链接/激活态（足够深，白字对比达标）
-backgroundColor = "#FFFFFF"                   # 主内容背景（最浅）
-secondaryBackgroundColor = "#F6F8FA"           # 卡片/控件背景（略深）
-textColor = "#1F2328"                         # 正文（深灰，与白底对比达标）
-linkColor = "#2563EB"
-borderColor = "#D0D7DE"
+primaryColor = "#4F46E5"                      # 品牌靛蓝（按钮/链接/激活态，白字对比达标）
+backgroundColor = "#FFFFFF"                    # 主内容背景（最浅）
+secondaryBackgroundColor = "#F1F5F9"          # 卡片/控件背景（浅蓝灰，弱化“灰蒙蒙”感）
+textColor = "#0F172A"                         # 正文（深石板蓝）
+linkColor = "#4F46E5"
+borderColor = "#CBD5E1"
 showWidgetBorder = true
 showSidebarBorder = true
-baseRadius = "8px"
-buttonRadius = "8px"
+baseRadius = "10px"
+buttonRadius = "10px"
 
-font = "'Inter':https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
-codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
-baseFontSize = 14
+# 字体：拉丁/数字用 Inter，中文用 Noto Sans SC；字体加载失败时回退系统字体
+# （Windows 微软雅黑 / macOS 苹方），保证中文始终可读
+font = "'Inter', 'Noto Sans SC', 'Microsoft YaHei', 'PingFang SC', sans-serif:https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap"
+headingFont = "'Inter', 'Noto Sans SC', 'Microsoft YaHei', 'PingFang SC', sans-serif:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&family=Noto+Sans+SC:wght@500;600;700&display=swap"
+codeFont = "'JetBrains Mono', 'Noto Sans Mono', 'Microsoft YaHei', monospace:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Noto+Sans+Mono:wght@400;500&display=swap"
+
+# 字号：正文放至 16px（中文更易读）；标题层级从 30px 到 13px 递减
+baseFontSize = 16
+baseFontWeight = 400
+codeFontSize = "13px"
+codeFontWeight = 400
+codeTextColor = "#0F172A"
+codeBackgroundColor = "#F1F5F9"
+metricValueFontSize = "2rem"
+metricValueFontWeight = 700
+headingFontSizes = ["30px", "24px", "20px", "17px", "15px", "13px"]
+headingFontWeights = [700, 700, 600, 600, 500, 500]
 linkUnderline = false
 
-# 语义色：badge / markdown 上色 / 状态
-blueColor = "#2563EB"
-greenColor = "#1A7F37"
-greenBackgroundColor = "#DAFBE1"
-greenTextColor = "#116329"
-redColor = "#CF222E"
-orangeColor = "#BF8700"
-violetColor = "#8250DF"
-grayColor = "#57606A"
+# 语义色：badge / markdown 上色 / 状态提示（含背景与文字变体）
+blueColor = "#3B82F6"
+blueBackgroundColor = "#DBEAFE"
+blueTextColor = "#1D4ED8"
+greenColor = "#10B981"
+greenBackgroundColor = "#D1FAE5"
+greenTextColor = "#047857"
+redColor = "#F43F5E"
+redBackgroundColor = "#FFE4E6"
+redTextColor = "#BE123C"
+orangeColor = "#F97316"
+orangeBackgroundColor = "#FFEDD5"
+orangeTextColor = "#C2410C"
+yellowColor = "#F59E0B"
+yellowBackgroundColor = "#FEF3C7"
+yellowTextColor = "#B45309"
+violetColor = "#8B5CF6"
+violetBackgroundColor = "#EDE9FE"
+violetTextColor = "#6D28D9"
+grayColor = "#64748B"
 
-# 图表配色（Plotly/Altair 自动套用）
-chartCategoricalColors = ["#2563EB", "#1A7F37", "#BF3989", "#8250DF", "#CF222E", "#BF8700", "#57606A"]
+# 图表配色（Altair/Plotly 自动套用）——高彩度分类色板
+chartCategoricalColors = ["#4F46E5", "#10B981", "#F43F5E", "#F59E0B", "#0EA5E9", "#8B5CF6", "#14B8A6", "#EC4899"]
+chartSequentialColors = ["#EEF2FF", "#C7D2FE", "#A5B4FC", "#818CF8", "#6366F1", "#4F46E5", "#4338CA", "#3730A3", "#312E81", "#1E1B4B"]
 
-dataframeBorderColor = "#D0D7DE"
-dataframeHeaderBackgroundColor = "#F6F8FA"
+dataframeBorderColor = "#E2E8F0"
+dataframeHeaderBackgroundColor = "#E0E7FF"     # 表头带淡淡靛蓝
 
 [theme.sidebar]
-backgroundColor = "#F6F8FA"
-secondaryBackgroundColor = "#EAEFF2"
-textColor = "#1F2328"
-borderColor = "#D0D7DE"
-primaryColor = "#2563EB"
+backgroundColor = "#EEF2FF"                    # 靛蓝底侧栏，与主区形成色彩层次
+secondaryBackgroundColor = "#E0E7FF"
+textColor = "#312E81"
+borderColor = "#C7D2FE"
+primaryColor = "#4F46E5"
 
 # 同时定义 light/dark，用户可在设置菜单切换
 [theme.light]
-primaryColor = "#2563EB"
+primaryColor = "#4F46E5"
 backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F6F8FA"
-textColor = "#1F2328"
+secondaryBackgroundColor = "#F1F5F9"
+textColor = "#0F172A"
+
+[theme.light.sidebar]
+backgroundColor = "#EEF2FF"
+secondaryBackgroundColor = "#E0E7FF"
+textColor = "#312E81"
+borderColor = "#C7D2FE"
 
 [theme.dark]
-primaryColor = "#58A6FF"
-backgroundColor = "#0D1117"
-secondaryBackgroundColor = "#161B22"
-textColor = "#E6EDF3"
+primaryColor = "#818CF8"                      # 暗色下用更亮的靛蓝
+backgroundColor = "#0F172A"
+secondaryBackgroundColor = "#1E293B"
+textColor = "#E2E8F0"
+borderColor = "#334155"
+
+[theme.dark.sidebar]
+backgroundColor = "#111827"
+secondaryBackgroundColor = "#1F2937"
+borderColor = "#374151"

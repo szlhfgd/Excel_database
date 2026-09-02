@@ -236,17 +236,23 @@ def summarize(conn: sqlite3.Connection, name: str) -> dict:
     return {"row_count": row_count, "columns": result_columns}
 
 
-def column_value_counts(conn: sqlite3.Connection, name: str, col: str, limit: int = 10) -> list[tuple[str, int]]:
-    """Return top *limit* (value, count) pairs for a text column, ordered by count desc."""
-    rows = conn.execute(
+def column_value_counts(conn: sqlite3.Connection, name: str, col: str, limit: int | None = 10) -> list[tuple[str, int]]:
+    """Return (value, count) pairs for a column, ordered by count desc.
+
+    Excludes NULLs. ``limit=None`` returns every distinct value.
+    """
+    sql = (
         f'SELECT "{col}" AS v, COUNT(*) AS cnt '
         f'FROM "{name}" '
         f'WHERE "{col}" IS NOT NULL '
         f'GROUP BY "{col}" '
-        f'ORDER BY cnt DESC '
-        f'LIMIT ?',
-        (limit,),
-    ).fetchall()
+        f'ORDER BY cnt DESC'
+    )
+    params: list[object] = []
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, params).fetchall()
     return [(str(r["v"]), r["cnt"]) for r in rows]
 
 

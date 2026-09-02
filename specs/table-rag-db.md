@@ -69,11 +69,12 @@
 - **密钥管理**：`python-dotenv` 读取项目根 `.env` 的 `SILICONFLOW_API_KEY`；`.env` 须加入 `.gitignore`，绝不入库/日志。
 - **LLM 客户端**：`openai` SDK 配置 `base_url` 指向硅基流动兼容端点；NL2SQL 用 DeepSeek-V3，embedding 用 `BAAI/bge-m3`。
 - **前端布局**：Streamlit 左 `st.sidebar` 放文件上传器 + 表勾选 `st.multiselect` + 删除表按钮；主区域放模式 `st.radio`（hybrid/ask/sql）+ 查询 `st.text_input`/`st.text_area` + 结果 Tabs。UI 文案全中文。
-- **模块划分**：
-  - `ingest.py`：读文件、清洗、建表、构建 embedding、写入向量表。
-  - `db.py`：SQLite 连接、建表 DDL、行 CRUD、向量表读写（sqlite-vec 加载）。
-  - `search.py`：BM25（`rank_bm25`）、语义检索（sqlite-vec 查询）、RRF 融合。
-  - `llm.py`：硅基流动客户端封装（NL2SQL 生成 + embedding 调用 + 错误重试）。
+- **模块划分**（`src/` 包，按层分组）：
+  - `src/services/ingest.py`：读文件、清洗、建表、构建 embedding、写入向量表。
+  - `src/data/db.py`：SQLite 连接、建表 DDL、行 CRUD、向量表读写（sqlite-vec 加载）。
+  - `src/services/search.py`：BM25（`rank_bm25`）、语义检索（sqlite-vec 查询）、RRF 融合。
+  - `src/ai/llm.py`：硅基流动客户端封装（NL2SQL 生成 + embedding 调用 + 错误重试）。
+  - `src/services/queries.py`：查询/分析编排（混合搜索、NL2SQL、RAG、统计），无 `st.*` 依赖。
   - `app.py`：Streamlit UI、模式路由、调用上述模块、渲染结果。
 
 ## Testing Decisions

@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from execute_sql import ReadOnlySQLViolation, assert_readonly_sql
+from src.ai.execute_sql import ReadOnlySQLViolation, assert_readonly_sql
 
 
 # ---- assert_readonly_sql: allow-list --------------------------------------
@@ -87,12 +87,12 @@ def test_allowed_tables_restriction():
 
 
 def test_run_query_rejects_destructive_sql(monkeypatch):
-    import app
+    from src.services import queries
 
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE t (a INT)")
 
-    cols, rows, err = app.sql_query(conn, "DELETE FROM t")
+    cols, rows, err = queries.sql_query(conn, "DELETE FROM t")
     assert err is not None and "只读" in err
     assert cols == []
     assert rows == []
@@ -100,5 +100,5 @@ def test_run_query_rejects_destructive_sql(monkeypatch):
     # Trying to mutate via a hand-written statement must not change data.
     conn.execute("INSERT INTO t VALUES (1)")
     conn.commit()
-    app.sql_query(conn, "UPDATE t SET a = 99")
+    queries.sql_query(conn, "UPDATE t SET a = 99")
     assert conn.execute("SELECT a FROM t").fetchone()[0] == 1

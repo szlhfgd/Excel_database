@@ -5,11 +5,11 @@ from pathlib import Path
 
 import pytest
 
-import app
-import db as db_mod
-import llm as llm_mod
-import search as search_mod
-import ingest as ingest_mod
+from src.services import queries
+from src.data import db as db_mod
+from src.ai import llm as llm_mod
+from src.services import search as search_mod
+from src.services import ingest as ingest_mod
 
 APP_PATH = str(Path(__file__).resolve().parent.parent / "app.py")
 
@@ -22,7 +22,7 @@ def _uniq() -> str:
 
 
 def test_to_csv_dict_list_uses_utf8sig_bom():
-    out = app._to_csv([{"姓名": "张三", "年龄": 30}])
+    out = queries._to_csv([{"姓名": "张三", "年龄": 30}])
     assert out[:3] == b"\xef\xbb\xbf"
     text = out.decode("utf-8-sig")
     assert "姓名,年龄" in text
@@ -30,11 +30,11 @@ def test_to_csv_dict_list_uses_utf8sig_bom():
 
 
 def test_to_csv_empty_returns_empty_bytes():
-    assert app._to_csv([]) == b""
+    assert queries._to_csv([]) == b""
 
 
 def test_to_csv_list_of_lists_uses_csv_writer():
-    out = app._to_csv([[1, 2], [3, 4]])
+    out = queries._to_csv([[1, 2], [3, 4]])
     text = out.decode("utf-8-sig")
     assert "1,2" in text
     assert "3,4" in text
@@ -47,14 +47,14 @@ def test_run_query_returns_columns_and_rows():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE t (a INT, b TEXT)")
     conn.execute("INSERT INTO t VALUES (1, 'x')")
-    cols, rows = app._run_query(conn, "SELECT * FROM t")
+    cols, rows = queries._run_query(conn, "SELECT * FROM t")
     assert cols == ["a", "b"]
     assert rows == [{"a": 1, "b": "x"}]
 
 
 def test_run_query_no_result_returns_empty():
     conn = sqlite3.connect(":memory:")
-    cols, rows = app._run_query(conn, "SELECT * FROM sqlite_master WHERE name='__never__'")
+    cols, rows = queries._run_query(conn, "SELECT * FROM sqlite_master WHERE name='__never__'")
     assert rows == []
 
 
@@ -79,10 +79,10 @@ def test_ask_retries_once_on_sql_error(monkeypatch):
         return (["a", "b"], [{"a": 1, "b": 2}])
 
     monkeypatch.setattr(llm_mod, "generate_sql", fake_gen)
-    monkeypatch.setattr(app, "_run_query", fake_run)
+    monkeypatch.setattr(queries, "_run_query", fake_run)
     monkeypatch.setattr(db_mod, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
 
-    sql, cols, rows, err = app._ask(None, ["t"], "q")
+    sql, cols, rows, err = queries._ask(None, ["t"], "q")
     assert sql == "SELECT * FROM t"
     assert calls["gen"] == 2
     assert calls["run"] == 2
@@ -92,10 +92,10 @@ def test_ask_retries_once_on_sql_error(monkeypatch):
 
 def test_ask_returns_error_after_max_retries(monkeypatch):
     monkeypatch.setattr(llm_mod, "generate_sql", lambda s, q, prev_error=None: "BAD")
-    monkeypatch.setattr(app, "_run_query", lambda c, sql: (_ for _ in ()).throw(sqlite3.OperationalError("err")))
+    monkeypatch.setattr(queries, "_run_query", lambda c, sql: (_ for _ in ()).throw(sqlite3.OperationalError("err")))
     monkeypatch.setattr(db_mod, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
 
-    sql, cols, rows, err = app._ask(None, ["t"], "q")
+    sql, cols, rows, err = queries._ask(None, ["t"], "q")
     assert err is not None
     assert "NL2SQL" in err
     assert rows is None
@@ -103,17 +103,17 @@ def test_ask_returns_error_after_max_retries(monkeypatch):
 
 def test_ask_query_success(monkeypatch):
     monkeypatch.setattr(llm_mod, "generate_sql", lambda schemas, q, prev_error=None: "SELECT * FROM t")
-    monkeypatch.setattr(app, "_run_query", lambda c, sql: (["a"], [{"a": 1}]))
+    monkeypatch.setattr(queries, "_run_query", lambda c, sql: (["a"], [{"a": 1}]))
     monkeypatch.setattr(db_mod, "get_schema", lambda c, t: {"table": t, "columns": [], "sample_rows": []})
-    sql, cols, rows, err = app.ask_query(None, ["t"], "q")
+    sql, cols, rows, err = queries.ask_query(None, ["t"], "q")
     assert sql == "SELECT * FROM t"
     assert rows == [{"a": 1}]
     assert err is None
 
 
 def test_ask_query_surfaces_error(monkeypatch):
-    monkeypatch.setattr(app, "_ask", lambda c, s, q, max_attempts=2: ("SELECT * FROM t", [], None, "boom"))
-    sql, cols, rows, err = app.ask_query(None, ["t"], "q")
+    monkeypatch.setattr(queries, "_ask", lambda c, s, q, max_attempts=2: ("SELECT * FROM t", [], None, "boom"))
+    sql, cols, rows, err = queries.ask_query(None, ["t"], "q")
     assert err == "boom"
     assert rows == []
 
@@ -124,9 +124,9 @@ def test_ask_query_surfaces_error(monkeypatch):
 def test_hybrid_query_success(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
-    rows, err = app.hybrid_query(None, ["t"], "q")
+    rows, err = queries.hybrid_query(None, ["t"], "q")
     assert err is None
     assert rows and rows[0]["a"] == 1
     assert rows[0]["__table"] == "t"
@@ -135,7 +135,7 @@ def test_hybrid_query_success(monkeypatch):
 
 def test_hybrid_query_error_surfaces(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: (_ for _ in ()).throw(RuntimeError("embed down")))
-    rows, err = app.hybrid_query(None, ["t"], "q")
+    rows, err = queries.hybrid_query(None, ["t"], "q")
     assert rows == []
     assert err is not None and "搜索出错" in err
 
@@ -148,11 +148,11 @@ def test_hybrid_query_reranks_to_top5(monkeypatch):
         lambda c, tables, q, vec, recall_pool=None: [("t", i, 1.0 - i * 0.1) for i in range(8)],
     )
     monkeypatch.setattr(
-        app, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
+        queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
     )
     # rerank score = document index → the last candidate scores highest
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [float(i) for i in range(len(docs))])
-    rows, err = app.hybrid_query(None, ["t"], "q", top_n=5)
+    rows, err = queries.hybrid_query(None, ["t"], "q", top_n=5)
     assert err is None
     assert len(rows) == 5
     assert rows[0]["__row_id"] == 7
@@ -166,10 +166,10 @@ def test_hybrid_query_rerank_failure_falls_back_to_rrf(monkeypatch):
         lambda c, tables, q, vec, recall_pool=None: [("t", i, 1.0 - i * 0.1) for i in range(8)],
     )
     monkeypatch.setattr(
-        app, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
+        queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
     )
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: (_ for _ in ()).throw(RuntimeError("rerank down")))
-    rows, err = app.hybrid_query(None, ["t"], "q", top_n=5)
+    rows, err = queries.hybrid_query(None, ["t"], "q", top_n=5)
     assert err is None
     assert len(rows) == 5
     # fallback keeps RRF order → row 0 first
@@ -186,11 +186,11 @@ def test_hybrid_query_reranks_beyond_old_pool(monkeypatch):
         lambda c, tables, q, vec, recall_pool=None: [("t", i, 1.0 - i * 0.01) for i in range(25)],
     )
     monkeypatch.setattr(
-        app, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
+        queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
     )
     # rerank score = document index → candidate 24 scores highest
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [float(i) for i in range(len(docs))])
-    rows, err = app.hybrid_query(None, ["t"], "q", top_n=5)
+    rows, err = queries.hybrid_query(None, ["t"], "q", top_n=5)
     assert err is None
     assert len(rows) == 5
     # candidate 24 (beyond the old pool of 20) now ranks first
@@ -205,10 +205,10 @@ def test_hybrid_query_respects_top_n(monkeypatch):
         lambda c, tables, q, vec, recall_pool=None: [("t", i, 1.0 - i * 0.01) for i in range(10)],
     )
     monkeypatch.setattr(
-        app, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
+        queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": r, "__row_text": f"text {r}", "a": r}
     )
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [float(i) for i in range(len(docs))])
-    rows, err = app.hybrid_query(None, ["t"], "q", top_n=3)
+    rows, err = queries.hybrid_query(None, ["t"], "q", top_n=3)
     assert err is None
     assert len(rows) == 3
 
@@ -220,14 +220,14 @@ def test_sql_query_success():
     conn = sqlite3.connect(":memory:")
     conn.execute("CREATE TABLE t (a INT, b TEXT)")
     conn.execute("INSERT INTO t VALUES (1, 'x')")
-    cols, rows, err = app.sql_query(conn, "SELECT * FROM t")
+    cols, rows, err = queries.sql_query(conn, "SELECT * FROM t")
     assert err is None
     assert rows == [{"a": 1, "b": "x"}]
 
 
 def test_sql_query_error_surfaces():
     conn = sqlite3.connect(":memory:")
-    cols, rows, err = app.sql_query(conn, "SELECT * FROM nope")
+    cols, rows, err = queries.sql_query(conn, "SELECT * FROM nope")
     assert err is not None and "SQL 执行出错" in err
     assert rows == []
 
@@ -241,7 +241,7 @@ def test_build_hybrid_rows_and_display_json():
     def fetch(table, row_id):
         return {"row_id": row_id, "__row_text": f"full text for {table} {row_id}", "col": 1}
 
-    rows = app._build_hybrid_rows(results, fetch)
+    rows = queries._build_hybrid_rows(results, fetch)
     assert rows[0]["col"] == 1
     assert rows[0]["__table"] == "t1"
     assert rows[0]["__row_id"] == 3
@@ -249,7 +249,7 @@ def test_build_hybrid_rows_and_display_json():
     assert "行号" not in rows[0]
     assert "分数" not in rows[0]
     assert "摘要" not in rows[0]
-    assert app._row_display_json({"row_id": 1, "__row_text": "x", "a": 2}) == {"row_id": 1, "a": 2}
+    assert queries._row_display_json({"row_id": 1, "__row_text": "x", "a": 2}) == {"row_id": 1, "a": 2}
 
 
 def test_build_hybrid_rows_skips_rows_with_no_visible_data():
@@ -263,7 +263,7 @@ def test_build_hybrid_rows_skips_rows_with_no_visible_data():
             return {"row_id": row_id, "__row_text": "x", "name": None, "price": None, "sheet": "S", "src_row": 5}
         return {"row_id": row_id, "__row_text": "x", "name": "car", "price": 0}
 
-    rows = app._build_hybrid_rows(results, fetch)
+    rows = queries._build_hybrid_rows(results, fetch)
     assert [r["__table"] for r in rows] == ["t1", "t3"]
     # price 0 is a real value, not empty — row must be kept.
     assert rows[1]["price"] == 0
@@ -278,11 +278,11 @@ def test_fetch_row_by_id_returns_matching_row():
     conn.execute("CREATE TABLE t (row_id INTEGER PRIMARY KEY, __row_text TEXT, a INT)")
     conn.execute("INSERT INTO t VALUES (1, 'text one', 10)")
     conn.execute("INSERT INTO t VALUES (3, 'text three', 30)")
-    row = app._fetch_row_by_id(conn, "t", 3)
+    row = queries._fetch_row_by_id(conn, "t", 3)
     assert row is not None
     assert row["row_id"] == 3
     assert row["a"] == 30
-    assert app._fetch_row_by_id(conn, "t", 99) is None
+    assert queries._fetch_row_by_id(conn, "t", 99) is None
 
 
 # ---- preview ---------------------------------------------------------------
@@ -296,7 +296,7 @@ def test_preview_returns_first_n_rows_excluding_internal_cols():
     for i in range(7):
         conn.execute(f'INSERT INTO "{name}" (name, val) VALUES (?, ?)', (f"r{i}", i))
     conn.commit()
-    cols, rows = app.preview(conn, name, n=5)
+    cols, rows = queries.preview(conn, name, n=5)
     assert "row_id" not in cols
     assert "__row_text" not in cols
     assert len(rows) == 5
@@ -311,7 +311,7 @@ def test_preview_empty_table_returns_empty():
     name = _uniq()
     conn.execute(f'CREATE TABLE "{name}" (row_id INTEGER PRIMARY KEY, __row_text TEXT, a INT)')
     conn.commit()
-    cols, rows = app.preview(conn, name, n=5)
+    cols, rows = queries.preview(conn, name, n=5)
     assert cols == []
     assert rows == []
 
@@ -326,7 +326,7 @@ def test_delete_table_removes_table_and_vec():
     conn.execute(f'CREATE TABLE "{name}" (row_id INTEGER PRIMARY KEY, a INT)')
     conn.execute(f'CREATE TABLE "vec_{name}" (row_id INTEGER PRIMARY KEY, vec TEXT)')
     conn.commit()
-    app.delete_table(conn, name)
+    queries.delete_table(conn, name)
     assert name not in db_mod.list_tables(conn)
 
 
@@ -336,7 +336,7 @@ def test_delete_table_propagates_error(monkeypatch):
 
     monkeypatch.setattr(db_mod, "delete_table", boom)
     with pytest.raises(RuntimeError):
-        app.delete_table(None, "x")
+        queries.delete_table(None, "x")
 
 
 # ---- list_tables -----------------------------------------------------------
@@ -346,7 +346,7 @@ def test_list_tables_delegates(monkeypatch):
     dummy = types.SimpleNamespace(close=lambda: None)
     monkeypatch.setattr(db_mod, "get_conn", lambda: dummy)
     monkeypatch.setattr(db_mod, "list_tables", lambda c: ["a", "b"])
-    assert app.list_tables() == ["a", "b"]
+    assert queries.list_tables() == ["a", "b"]
 
 
 # ---- ingest_file -----------------------------------------------------------
@@ -363,7 +363,7 @@ def test_ingest_file_returns_name_and_updated_and_wires_progress(monkeypatch):
         return ("x", False)
 
     monkeypatch.setattr(ingest_mod, "ingest_file", fake_ingest)
-    name, updated = app.ingest_file("/tmp/x.csv", on_progress=lambda f, m: fracs.append(f))
+    name, updated = queries.ingest_file("/tmp/x.csv", on_progress=lambda f, m: fracs.append(f))
     assert name == "x"
     assert updated is False
     assert 0.5 in fracs
@@ -377,7 +377,7 @@ def test_app_ingest_file_forwards_header_row(monkeypatch):
         return ("x", False)
 
     monkeypatch.setattr(ingest_mod, "ingest_file", fake_ingest)
-    app.ingest_file("/tmp/x.csv", header_row=3)
+    queries.ingest_file("/tmp/x.csv", header_row=3)
     assert captured["header_row"] == 3
 
 
@@ -385,7 +385,7 @@ def test_app_ingest_file_forwards_header_row(monkeypatch):
 
 
 def test_columns_for_passthrough():
-    assert app._columns_for(["a", "b"]) == ["a", "b"]
+    assert queries._columns_for(["a", "b"]) == ["a", "b"]
 
 
 # ---- AppTest smoke ---------------------------------------------------------
@@ -416,7 +416,7 @@ def test_app_renders_result_dataframe_without_columns_kwarg():
 def test_rag_query_success(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
     captured = {}
 
@@ -426,7 +426,7 @@ def test_rag_query_success(monkeypatch):
 
     monkeypatch.setattr(llm_mod, "answer", fake_answer)
     monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
-    answer, rows, err = app.rag_query(None, ["t"], "q")
+    answer, rows, err = queries.rag_query(None, ["t"], "q")
     assert err is None
     assert answer == "答案文本"
     assert rows and rows[0]["__table"] == "t"
@@ -438,7 +438,7 @@ def test_rag_query_rows_exist_but_cannot_answer_web_fallback(monkeypatch):
     # falls back to live web search.
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
     monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: False)
     captured = {}
@@ -448,8 +448,8 @@ def test_rag_query_rows_exist_but_cannot_answer_web_fallback(monkeypatch):
         return "网络答案"
 
     monkeypatch.setattr(llm_mod, "answer", fake_answer)
-    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("网络搜索结果文本", None))
-    answer, rows, err = app.rag_query(None, ["t"], "q")
+    monkeypatch.setattr("src.ai.websearch.search", lambda q, max_results=5: ("网络搜索结果文本", None))
+    answer, rows, err = queries.rag_query(None, ["t"], "q")
     assert err is None
     assert answer == "网络答案"
     assert rows == []
@@ -467,8 +467,8 @@ def test_rag_query_no_results_web_fallback(monkeypatch):
         return "网络答案"
 
     monkeypatch.setattr(llm_mod, "answer", fake_answer)
-    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("网络搜索结果文本", None))
-    answer, rows, err = app.rag_query(None, ["t"], "q")
+    monkeypatch.setattr("src.ai.websearch.search", lambda q, max_results=5: ("网络搜索结果文本", None))
+    answer, rows, err = queries.rag_query(None, ["t"], "q")
     assert err is None
     assert answer == "网络答案"
     assert rows == []
@@ -478,8 +478,8 @@ def test_rag_query_no_results_web_fallback(monkeypatch):
 def test_rag_query_no_results_web_search_fails(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [])
-    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("", "网络搜索失败：超时"))
-    answer, rows, err = app.rag_query(None, ["t"], "q")
+    monkeypatch.setattr("src.ai.websearch.search", lambda q, max_results=5: ("", "网络搜索失败：超时"))
+    answer, rows, err = queries.rag_query(None, ["t"], "q")
     assert answer == ""
     assert rows == []
     assert err is not None and "网络搜索" in err
@@ -488,7 +488,7 @@ def test_rag_query_no_results_web_search_fails(monkeypatch):
 def test_rag_query_success_passes_db_source(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
     captured = {}
 
@@ -498,7 +498,7 @@ def test_rag_query_success_passes_db_source(monkeypatch):
 
     monkeypatch.setattr(llm_mod, "answer", fake_answer)
     monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
-    answer, rows, err = app.rag_query(None, ["t"], "q")
+    answer, rows, err = queries.rag_query(None, ["t"], "q")
     assert err is None
     assert answer == "答案文本"
     assert captured["source"] == "数据库表格：t（行 1）"
@@ -506,7 +506,7 @@ def test_rag_query_success_passes_db_source(monkeypatch):
 
 def test_rag_query_error_surfaces(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: (_ for _ in ()).throw(RuntimeError("embed down")))
-    answer, rows, err = app.rag_query(None, ["t"], "q")
+    answer, rows, err = queries.rag_query(None, ["t"], "q")
     assert answer == ""
     assert rows == []
     assert err is not None and "RAG" in err
@@ -515,7 +515,7 @@ def test_rag_query_error_surfaces(monkeypatch):
 def test_rag_query_stream_yields_answer_and_threads_history(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
     monkeypatch.setattr(llm_mod, "rerank", lambda q, docs: [0.5] * len(docs))
     monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
     captured = {}
@@ -529,7 +529,7 @@ def test_rag_query_stream_yields_answer_and_threads_history(monkeypatch):
     monkeypatch.setattr(llm_mod, "answer_stream", fake_answer_stream)
     history = [{"role": "user", "content": "上一问"}]
     out_rows: list = []
-    out = "".join(app.rag_query_stream(None, ["t"], "q", history=history, out_rows=out_rows))
+    out = "".join(queries.rag_query_stream(None, ["t"], "q", history=history, out_rows=out_rows))
     assert out == "流式答案"
     assert captured["history"] == history
     assert captured["source"] == "数据库表格：t（行 1）"
@@ -546,9 +546,9 @@ def test_rag_query_stream_no_rows_web_fallback(monkeypatch):
         yield "网络答案"
 
     monkeypatch.setattr(llm_mod, "answer_stream", fake_answer_stream)
-    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("网络搜索结果文本", None))
+    monkeypatch.setattr("src.ai.websearch.search", lambda q, max_results=5: ("网络搜索结果文本", None))
     out_rows: list = []
-    out = "".join(app.rag_query_stream(None, ["t"], "q", out_rows=out_rows))
+    out = "".join(queries.rag_query_stream(None, ["t"], "q", out_rows=out_rows))
     assert out == "网络答案"
     assert captured["source"] == "网络搜索（AnySearch）"
     assert out_rows == []
@@ -557,25 +557,25 @@ def test_rag_query_stream_no_rows_web_fallback(monkeypatch):
 def test_rag_query_stream_web_search_fails_yields_error(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [])
-    monkeypatch.setattr("websearch.search", lambda q, max_results=5: ("", "网络搜索失败：超时"))
-    out = "".join(app.rag_query_stream(None, ["t"], "q"))
+    monkeypatch.setattr("src.ai.websearch.search", lambda q, max_results=5: ("", "网络搜索失败：超时"))
+    out = "".join(queries.rag_query_stream(None, ["t"], "q"))
     assert "网络搜索" in out
 
 
 def test_rag_query_stream_error_yields_single_message(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: (_ for _ in ()).throw(RuntimeError("embed down")))
-    out = "".join(app.rag_query_stream(None, ["t"], "q"))
+    out = "".join(queries.rag_query_stream(None, ["t"], "q"))
     assert "RAG 问答出错" in out
 
 
 def test_rag_query_with_code_runs(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
+    monkeypatch.setattr(queries, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
     monkeypatch.setattr(llm_mod, "generate_code", lambda q, preview: "result = df['a'].sum()")
     monkeypatch.setattr(llm_mod, "answer", lambda q, ctx, source=None: "答案是 1")
-    answer, rows, code, code_result, err = app.rag_query_with_code(None, ["t"], "q")
+    answer, rows, code, code_result, err = queries.rag_query_with_code(None, ["t"], "q")
     assert err is None
     assert answer == "答案是 1"
     assert code == "result = df['a'].sum()"
@@ -586,11 +586,11 @@ def test_rag_query_with_code_runs(monkeypatch):
 def test_rag_query_with_review_runs(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(queries, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
     monkeypatch.setattr(llm_mod, "answer", lambda q, ctx, source=None: "张三的金额是200")
     monkeypatch.setattr(llm_mod, "review_answer", lambda q, ctx, ans: (True, "回答正确"))
-    answer, rows, verdict, critique, err = app.rag_query_with_review(None, ["t"], "q")
+    answer, rows, verdict, critique, err = queries.rag_query_with_review(None, ["t"], "q")
     assert err is None
     assert answer == "张三的金额是200"
     assert verdict is True
@@ -604,11 +604,11 @@ def test_rag_query_decomposed_single_subquery_delegates(monkeypatch):
     monkeypatch.setattr(llm_mod, "decompose_question", lambda q, s: [q])
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
+    monkeypatch.setattr(queries, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
     monkeypatch.setattr(llm_mod, "answer", lambda q, ctx, source=None: "答案")
     monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
-    answer, rows, err = app.rag_query_decomposed(None, ["t"], "q")
+    answer, rows, err = queries.rag_query_decomposed(None, ["t"], "q")
     assert err is None
     assert answer == "答案"
     assert rows and rows[0]["__table"] == "t"
@@ -619,8 +619,8 @@ def test_rag_query_decomposed_multi_subquery_synthesizes(monkeypatch):
     monkeypatch.setattr(llm_mod, "decompose_question", lambda q, s: ["子1", "子2"])
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
+    monkeypatch.setattr(queries, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "x", "a": 1})
     captured = {}
 
     def fake_answer(question, context, source=None):
@@ -629,7 +629,7 @@ def test_rag_query_decomposed_multi_subquery_synthesizes(monkeypatch):
 
     monkeypatch.setattr(llm_mod, "answer", fake_answer)
     monkeypatch.setattr(llm_mod, "can_answer", lambda q, ctx: True)
-    answer, rows, err = app.rag_query_decomposed(None, ["t"], "q")
+    answer, rows, err = queries.rag_query_decomposed(None, ["t"], "q")
     assert err is None
     assert answer == "综合答案"
     assert "子1" in captured["ctx"] and "子2" in captured["ctx"]
@@ -639,11 +639,11 @@ def test_rag_query_decomposed_multi_subquery_synthesizes(monkeypatch):
 def test_rag_query_dual_success(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [("t", 1, 0.9)])
-    monkeypatch.setattr(app, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
-    monkeypatch.setattr(app, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
-    monkeypatch.setattr(app, "ask_query", lambda c, s, q, max_attempts=2: ("SELECT 1", ["a"], [{"a": 1}], None))
+    monkeypatch.setattr(queries, "_rerank_results", lambda c, q, results, top_n=5: results[:top_n])
+    monkeypatch.setattr(queries, "_fetch_row_by_id", lambda c, t, r: {"row_id": 1, "__row_text": "客户 张三 金额 200", "a": 1})
+    monkeypatch.setattr(queries, "ask_query", lambda c, s, q, max_attempts=2: ("SELECT 1", ["a"], [{"a": 1}], None))
     monkeypatch.setattr(llm_mod, "cross_validate", lambda q, sql_ctx, text_ctx: "交叉验证答案")
-    answer, rows, sql, sql_ctx, err = app.rag_query_dual(None, ["t"], "q")
+    answer, rows, sql, sql_ctx, err = queries.rag_query_dual(None, ["t"], "q")
     assert err is None
     assert answer.startswith("交叉验证答案")
     assert "【来源：数据库表格：t（行 1）】" in answer
@@ -655,8 +655,8 @@ def test_rag_query_dual_success(monkeypatch):
 def test_rag_query_dual_no_results(monkeypatch):
     monkeypatch.setattr(llm_mod, "embed", lambda texts: [[0.1] * 1024])
     monkeypatch.setattr(search_mod, "hybrid_search", lambda c, tables, q, vec, recall_pool=None: [])
-    monkeypatch.setattr(app, "ask_query", lambda c, s, q, max_attempts=2: ("SELECT 1", [], [], None))
-    answer, rows, sql, sql_ctx, err = app.rag_query_dual(None, ["t"], "q")
+    monkeypatch.setattr(queries, "ask_query", lambda c, s, q, max_attempts=2: ("SELECT 1", [], [], None))
+    answer, rows, sql, sql_ctx, err = queries.rag_query_dual(None, ["t"], "q")
     assert answer == ""
     assert rows == []
     assert err is not None and "未找到" in err

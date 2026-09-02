@@ -5,8 +5,8 @@ import pandas as pd
 import pytest
 
 os.environ["SPREADSHEET_DB"] = ":memory:"
-import db
-import ingest
+from src.data import db
+from src.services import ingest
 
 
 def _write_csv(path, df, encoding="utf-8"):
@@ -39,7 +39,7 @@ def test_ingest_gbk_encoding():
 
 
 def llm_mod():
-    import llm
+    from src.ai import llm
     return llm
 
 

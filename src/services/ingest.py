@@ -1,8 +1,8 @@
 import os
 import math
 import pandas as pd
-import db
-import llm
+from ..data import db
+from ..ai import llm
 
 SEARCH_COLS: list[str] = []          # 参与向量化的列；空 = 全部数据列
 SEARCH_COL_MIN_CHARS = 10            # 单个列值字数超过该值才纳入拼接

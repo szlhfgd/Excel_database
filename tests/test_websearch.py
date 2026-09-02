@@ -2,7 +2,7 @@ import json
 import os
 from unittest import mock
 
-import websearch
+from src.ai import websearch
 
 
 def _fake_urlopen(payload, error=None):
@@ -34,7 +34,7 @@ def test_search_returns_text_content():
         return _fake_urlopen(payload)
 
     with mock.patch.dict(os.environ, {"ANYSEARCH_API_KEY": "test-key"}), \
-         mock.patch("websearch.urllib.request.urlopen", side_effect=fake_urlopen):
+         mock.patch("src.ai.websearch.urllib.request.urlopen", side_effect=fake_urlopen):
         text, err = websearch.search("苹果价格", max_results=5)
 
     assert err is None
@@ -50,7 +50,7 @@ def test_search_returns_text_content():
 
 def test_search_error_field_returns_error():
     payload = {"error": {"message": "quota exhausted"}}
-    with mock.patch("websearch.urllib.request.urlopen", return_value=_fake_urlopen(payload)):
+    with mock.patch("src.ai.websearch.urllib.request.urlopen", return_value=_fake_urlopen(payload)):
         text, err = websearch.search("q")
     assert text == ""
     assert err is not None and "quota exhausted" in err
@@ -58,7 +58,7 @@ def test_search_error_field_returns_error():
 
 def test_search_network_error_returns_error():
     with mock.patch(
-        "websearch.urllib.request.urlopen",
+        "src.ai.websearch.urllib.request.urlopen",
         side_effect=OSError("connection refused"),
     ):
         text, err = websearch.search("q")
@@ -75,6 +75,6 @@ def test_search_no_api_key_sends_no_auth_header():
         return _fake_urlopen(payload)
 
     with mock.patch.dict(os.environ, {"ANYSEARCH_API_KEY": ""}), \
-         mock.patch("websearch.urllib.request.urlopen", side_effect=fake_urlopen):
+         mock.patch("src.ai.websearch.urllib.request.urlopen", side_effect=fake_urlopen):
         websearch.search("q")
     assert captured["auth"] is None

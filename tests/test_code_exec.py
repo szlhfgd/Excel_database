@@ -1,6 +1,6 @@
 import pandas as pd
 
-import code_exec
+from src.ai import code_exec
 
 
 def test_run_code_assigns_result():

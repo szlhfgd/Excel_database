@@ -2,8 +2,8 @@ import sqlite3
 import uuid
 
 import pytest
-import db
-import app
+from src.data import db
+from src.services import queries
 
 
 # ---------------------------------------------------------------------------
@@ -46,14 +46,14 @@ def test_stats_query_returns_summary_for_selected(monkeypatch):
     }
     monkeypatch.setattr(db, "summarize", lambda conn, name: fake)
     conn = sqlite3.connect(":memory:")
-    summary, err = app.stats_query(conn, ["任意表"])
+    summary, err = queries.stats_query(conn, ["任意表"])
     assert err is None
     assert summary == fake
 
 
 def test_stats_query_no_selection_returns_error():
     conn = sqlite3.connect(":memory:")
-    summary, err = app.stats_query(conn, [])
+    summary, err = queries.stats_query(conn, [])
     assert summary is None
     assert "请先勾选" in err
 
@@ -197,7 +197,7 @@ def test_numeric_bins_all_null():
 
 
 # ---------------------------------------------------------------------------
-# New: app.build_stats_data
+# New: queries.build_stats_data
 # ---------------------------------------------------------------------------
 
 
@@ -223,7 +223,7 @@ def test_build_stats_data_keys():
             ("row3", None, None, "苹果"),
         )
         conn.commit()
-        data = app.build_stats_data(conn, name, bins=5, top_n=5)
+        data = queries.build_stats_data(conn, name, bins=5, top_n=5)
         assert "numeric_bins" in data
         assert "text_top_n" in data
         assert "missing" in data
@@ -255,10 +255,64 @@ def test_build_stats_data_empty_table():
             f'(row_id INTEGER PRIMARY KEY AUTOINCREMENT, __row_text TEXT, "A" TEXT)'
         )
         conn.commit()
-        data = app.build_stats_data(conn, name)
+        data = queries.build_stats_data(conn, name)
         # Column A has 0 non-null rows, so it's excluded from text_top_n / numeric_bins
         assert "A" not in data["text_top_n"]
         assert data["numeric_bins"] == {}
         assert data["missing"][0]["缺失数"] == 0
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# New: queries.category_counts (按列分类统计总个数)
+# ---------------------------------------------------------------------------
+
+
+def test_category_counts_counts_each_value():
+    conn = db.get_conn()
+    try:
+        name = f"t_cat_{uuid.uuid4().hex[:8]}"
+        conn.execute(
+            f'CREATE TABLE "{name}" '
+            f'(row_id INTEGER PRIMARY KEY AUTOINCREMENT, __row_text TEXT, "类别" TEXT)'
+        )
+        for val in ["A", "A", "B", None]:
+            conn.execute(f'INSERT INTO "{name}" (__row_text, "类别") VALUES (?, ?)', ("r", val))
+        conn.commit()
+        rows = queries.category_counts(conn, name, "类别")
+        assert rows == [{"值": "A", "数量": 2}, {"值": "B", "数量": 1}]
+    finally:
+        conn.close()
+
+
+def test_category_counts_limit_caps_rows_and_none_returns_all():
+    conn = db.get_conn()
+    try:
+        name = f"t_cat2_{uuid.uuid4().hex[:8]}"
+        conn.execute(
+            f'CREATE TABLE "{name}" '
+            f'(row_id INTEGER PRIMARY KEY AUTOINCREMENT, __row_text TEXT, "城市" TEXT)'
+        )
+        for city in ["北京", "上海", "北京", "广州"]:
+            conn.execute(f'INSERT INTO "{name}" (__row_text, "城市") VALUES (?, ?)', ("r", city))
+        conn.commit()
+        assert queries.category_counts(conn, name, "城市", limit=1) == [{"值": "北京", "数量": 2}]
+        assert len(queries.category_counts(conn, name, "城市", limit=None)) == 3
+    finally:
+        conn.close()
+
+
+def test_category_counts_all_null_returns_empty():
+    conn = db.get_conn()
+    try:
+        name = f"t_cat3_{uuid.uuid4().hex[:8]}"
+        conn.execute(
+            f'CREATE TABLE "{name}" '
+            f'(row_id INTEGER PRIMARY KEY AUTOINCREMENT, __row_text TEXT, "空" TEXT)'
+        )
+        conn.execute(f'INSERT INTO "{name}" (__row_text, "空") VALUES (?, ?)', ("r", None))
+        conn.commit()
+        assert queries.category_counts(conn, name, "空") == []
     finally:
         conn.close()

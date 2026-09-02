@@ -5,7 +5,7 @@ import pytest
 import pandas as pd
 
 os.environ["SPREADSHEET_DB"] = ":memory:"
-import db
+from src.data import db
 
 
 def test_create_and_read_roundtrip():

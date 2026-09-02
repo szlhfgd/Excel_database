@@ -3,8 +3,8 @@ from unittest import mock
 import pandas as pd
 
 os.environ["SPREADSHEET_DB"] = ":memory:"
-import db
-import search
+from src.data import db
+from src.services import search
 
 
 def test_hybrid_ranks_semantic_neighbor_first():
@@ -21,7 +21,7 @@ def test_hybrid_ranks_semantic_neighbor_first():
 
 
 def llm_embed():
-    import llm
+    from src.ai import llm
     return llm
 
 
@@ -123,7 +123,7 @@ def test_select_tables_returns_top_k_by_relevance(monkeypatch):
     for t in (fruits, cars):
         db.create_vec_table(conn, t)
         db.upsert_embeddings(conn, t, [1, 2], [[0.0] * db.EMBED_DIM, [0.0] * db.EMBED_DIM])
-    monkeypatch.setattr("llm.embed", lambda texts: [[0.0] * db.EMBED_DIM])
+    monkeypatch.setattr("src.ai.llm.embed", lambda texts: [[0.0] * db.EMBED_DIM])
     picked = search.select_tables(conn, "apple", k=2, recall_pool=20)
     assert picked[0] == fruits
     assert set(picked) == {fruits, cars}

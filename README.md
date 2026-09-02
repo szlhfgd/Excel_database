@@ -204,14 +204,20 @@ A：在 `.env` 中设置 `SPREADSHEET_DB` 指向新的 `.db` 文件路径。
 
 ```
 Excel_database/
-├── app.py          # Streamlit 主应用（UI + 查询编排）
-├── db.py           # SQLite 数据访问层（建表、读写、向量表）
-├── ingest.py       # 文件导入与向量化
-├── search.py       # 混合检索（BM25 + 向量 + RRF 融合）
-├── llm.py          # 大模型调用（向量化、重排、NL2SQL、RAG 回答）
-├── code_exec.py    # 代码解释器沙箱
-├── eval.py         # 问答评测工具
-├── main.py         # 原始模板（可忽略）
+├── app.py          # Streamlit 主应用（仅 UI 层，调用 src.services）
+├── eval.py         # 问答评测工具（导入 src.services.queries）
+├── src/
+│   ├── services/   # 业务编排层（混合搜索、NL2SQL、RAG、统计、导入、检索）
+│   │   ├── queries.py    # 查询/分析编排（无 st.* 依赖）
+│   │   ├── ingest.py     # 文件导入与向量化
+│   │   └── search.py     # 混合检索（BM25 + 向量 + RRF 融合）
+│   ├── data/       # 数据访问层
+│   │   └── db.py         # SQLite + 向量表（建表、读写）
+│   └── ai/         # 模型与外部能力层
+│       ├── llm.py        # 大模型调用（向量化、重排、NL2SQL、RAG 回答）
+│       ├── code_exec.py   # 代码解释器沙箱
+│       ├── websearch.py   # 网络搜索兜底
+│       └── execute_sql.py # 只读 SQL 校验
 ├── 启动.cmd        # Windows 一键启动脚本
 ├── requirements.txt
 ├── .gitignore      # 忽略 .env / *.db / .venv 等

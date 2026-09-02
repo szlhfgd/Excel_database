@@ -1,10 +1,10 @@
 import os
 from unittest import mock
-import llm
+from src.ai import llm
 
 
 def test_generate_sql_strips_fences_and_includes_schema():
-    import llm
+    from src.ai import llm
     captured = {}
 
     class FakeMsg:
@@ -43,7 +43,7 @@ def test_generate_sql_strips_fences_and_includes_schema():
 
 
 def test_generate_sql_passes_prev_error():
-    import llm
+    from src.ai import llm
     captured = {}
 
     class FakeMsg:
@@ -344,7 +344,7 @@ def test_answer_stream_caps_history_turns():
 def test_rerank_returns_scores_in_document_order():
     import json
     from unittest import mock
-    import llm
+    from src.ai import llm
 
     fake_response = mock.Mock()
     fake_response.read.return_value = json.dumps(
@@ -355,19 +355,19 @@ def test_rerank_returns_scores_in_document_order():
     fake_cm.__exit__ = mock.Mock(return_value=False)
 
     with mock.patch.dict(os.environ, {"SILICONFLOW_API_KEY": "test-key"}), \
-         mock.patch("llm.urllib.request.urlopen", return_value=fake_cm):
+         mock.patch("src.ai.llm.urllib.request.urlopen", return_value=fake_cm):
         scores = llm.rerank("q", ["doc0", "doc1"])
     assert scores == [0.3, 0.9]
 
 
 def test_rerank_empty_documents_returns_empty():
-    import llm
+    from src.ai import llm
 
     assert llm.rerank("q", []) == []
 
 
 def test_review_answer_parses_pass():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     class FakeChoice:
@@ -392,7 +392,7 @@ def test_review_answer_parses_pass():
 
 
 def test_review_answer_fallback_on_bad_json():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     class FakeChoice:
@@ -417,7 +417,7 @@ def test_review_answer_fallback_on_bad_json():
 
 
 def test_can_answer_true_when_context_sufficient():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     class FakeChoice:
@@ -440,7 +440,7 @@ def test_can_answer_true_when_context_sufficient():
 
 
 def test_can_answer_false_when_context_insufficient():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     class FakeChoice:
@@ -463,7 +463,7 @@ def test_can_answer_false_when_context_insufficient():
 
 
 def test_can_answer_defaults_true_on_bad_json():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     class FakeChoice:
@@ -486,7 +486,7 @@ def test_can_answer_defaults_true_on_bad_json():
 
 
 def test_generate_sql_renders_column_samples_when_present():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     captured = {}
@@ -526,7 +526,7 @@ def test_generate_sql_renders_column_samples_when_present():
 
 
 def test_generate_sql_falls_back_to_sample_rows_without_column_samples():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     captured = {}
@@ -560,7 +560,7 @@ def test_generate_sql_falls_back_to_sample_rows_without_column_samples():
 
 
 def test_decompose_question_parses_json_array():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     captured = {}
@@ -587,7 +587,7 @@ def test_decompose_question_parses_json_array():
 
 
 def test_decompose_question_fallback_on_unparseable():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     class FakeChoice:
@@ -611,7 +611,7 @@ def test_decompose_question_fallback_on_unparseable():
 
 
 def test_cross_validate_returns_content():
-    import llm
+    from src.ai import llm
     from unittest import mock
 
     captured = {}

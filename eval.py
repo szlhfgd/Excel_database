@@ -6,7 +6,7 @@ so the pipeline can be regression-checked without a full benchmark suite.
 """
 from __future__ import annotations
 
-import app as _app
+from src.services import queries as _q
 
 
 def _normalize(s: str) -> str:
@@ -33,11 +33,11 @@ def run_eval(
         selected = case.get("selected", [])
         expected = case.get("expected", "")
         if use_code:
-            answer, _rows, _code, _code_result, err = _app.rag_query_with_code(
+            answer, _rows, _code, _code_result, err = _q.rag_query_with_code(
                 conn, selected, question, top_n=top_n
             )
         else:
-            answer, _rows, err = _app.rag_query(conn, selected, question, top_n=top_n)
+            answer, _rows, err = _q.rag_query(conn, selected, question, top_n=top_n)
         ok = (err is None) and bool(expected) and _normalize(expected) in _normalize(answer)
         if ok:
             passed += 1

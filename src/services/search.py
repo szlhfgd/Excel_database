@@ -1,6 +1,6 @@
 import re
 import jieba
-import db
+from ..data import db
 from rank_bm25 import BM25Okapi
 
 RRF_K = 60
@@ -95,7 +95,7 @@ def select_tables(conn: db.sqlite3.Connection, question: str, k: int = 3, recall
     RRF score by table, so the user doesn't have to select tables manually.
     Returns [] when there are no tables.
     """
-    import llm
+    from ..ai import llm
 
     tables = db.list_tables(conn)
     if not tables:
