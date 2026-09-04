@@ -1,19 +1,40 @@
 import json
 import os
 import urllib.request
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, AuthenticationError, APITimeoutError
 
 
 def _client() -> OpenAI:
+    """Chat / NL2SQL / RAG client — routes to the JAC custom platform."""
+    api_key = os.environ.get("JAC_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            "模型服务未配置：JAC_API_KEY 为空。请检查 .env 是否存在、是否被加载（app.py 调用 load_dotenv()）。"
+        )
     return OpenAI(
-        api_key=os.environ.get("SILICONFLOW_API_KEY", ""),
+        api_key=api_key,
+        base_url=os.environ.get("JAC_BASE_URL", "http://192.168.190.182:3000/v1"),
+        timeout=float(os.environ.get("LLM_TIMEOUT", "120")),
+        max_retries=0,
+    )
+
+
+def _sf_client() -> OpenAI:
+    """Embedding client — routes to SiliconFlow for speed (JAC's bge-m3 is too slow)."""
+    api_key = os.environ.get("SILICONFLOW_API_KEY", "")
+    if not api_key:
+        raise RuntimeError(
+            "向量化服务未配置：SILICONFLOW_API_KEY 为空。请检查 .env 中的 SILICONFLOW_API_KEY 配置。"
+        )
+    return OpenAI(
+        api_key=api_key,
         base_url=os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"),
         timeout=float(os.environ.get("LLM_TIMEOUT", "120")),
         max_retries=0,
     )
 
 
-# Maximum characters sent to the embedding model per input. The SiliconFlow
+# Maximum characters sent to the embedding model per input. The custom platform
 # embedding API rejects over-long inputs with code 20015, so we truncate
 # defensively. bge-m3's 8192-token context is exceeded well before 10k CJK
 # characters; 4000 chars stays safely under the limit for both CJK and Latin text.
@@ -71,7 +92,7 @@ def embed(texts: list[str]) -> list[list[float]]:
     model = os.environ.get("EMBED_MODEL", "BAAI/bge-m3")
     safe = _sanitize_embed_inputs(texts)
     try:
-        resp = _client().embeddings.create(model=model, input=safe)
+        resp = _sf_client().embeddings.create(model=model, input=safe)
     except Exception as exc:
         # SiliconFlow returns code 20015 for oversized batches or inputs that
         # still exceed the model's token limit after truncation.  Split the
@@ -80,6 +101,19 @@ def embed(texts: list[str]) -> list[list[float]]:
         if "20015" in str(exc) and len(safe) > 1:
             mid = len(safe) // 2
             return embed(safe[:mid]) + embed(safe[mid:])
+        # Translate low-level OpenAI SDK errors into clear Chinese messages so
+        # the UI shows a readable st.error() instead of a cryptic traceback or
+        # a bare "Connection lost." when the WebSocket dies before the error
+        # surfaces. Only wrap credential / connectivity failures; let other
+        # exceptions (e.g. 20015 above, programming errors) pass through.
+        if isinstance(exc, AuthenticationError):
+            raise RuntimeError(
+                "向量化失败：API Key 无效或未授权（SILICONFLOW_API_KEY）。请检查 .env 中的 SILICONFLOW_API_KEY 配置。"
+            ) from exc
+        if isinstance(exc, (APITimeoutError, APIConnectionError)):
+            raise RuntimeError(
+                "向量化失败：无法连接 SiliconFlow 服务或请求超时。请检查网络和 SILICONFLOW_BASE_URL 配置。"
+            ) from exc
         raise
     return [d.embedding for d in resp.data]
 
@@ -100,7 +134,7 @@ def _render_schema(s: dict) -> str:
 
 
 def generate_sql(table_schemas: list[dict], query: str, prev_error: str | None = None) -> str:
-    model = os.environ.get("NL2SQL_MODEL", "deepseek-ai/DeepSeek-V3")
+    model = os.environ.get("NL2SQL_MODEL", "deepseek_v4")
     schema_block = "\n\n".join(_render_schema(s) for s in table_schemas)
     system = (
         "你是一个 SQLite 专家。根据用户自然语言问题，只输出一条可在 SQLite 执行的 SQL，"
@@ -142,7 +176,7 @@ def decompose_question(question: str, schemas: list[dict]) -> list[str]:
     Returns a list of subqueries (at least one). If the model output cannot be
     parsed, the original question is returned unchanged as a safe fallback.
     """
-    model = os.environ.get("DECOMPOSE_MODEL", os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3"))
+    model = os.environ.get("DECOMPOSE_MODEL", os.environ.get("RAG_MODEL", "deepseek_v4"))
     schema_block = "\n\n".join(
         f"表 `{s['table']}`:\n列: " + ", ".join(f"{c} {t}" for c, t in s["columns"])
         for s in schemas
@@ -192,7 +226,7 @@ def answer(question: str, context: str, source: str | None = None) -> str:
     When *source* is provided (e.g. "数据库表格：t1、t2" or "网络搜索（AnySearch）"),
     the model is instructed to end the answer with a 【来源：...】 line.
     """
-    model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
+    model = os.environ.get("RAG_MODEL", "deepseek_v4")
     system = RAG_SYSTEM_PROMPT + "\n\n【参考上下文】\n" + context + "\n【/参考上下文】"
     if source:
         system += (
@@ -219,7 +253,7 @@ def answer_stream(question: str, context: str, source: str | None = None, histor
     sent as conversation history without their (now stale) contexts. History is
     capped to ``MAX_HISTORY_TURNS`` to bound token usage.
     """
-    model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
+    model = os.environ.get("RAG_MODEL", "deepseek_v4")
     system = RAG_SYSTEM_PROMPT + "\n\n【参考上下文】\n" + context + "\n【/参考上下文】"
     if source:
         system += (
@@ -287,7 +321,7 @@ CODE_SYSTEM_PROMPT = """你是一名数据分析助手。用户会给你一个 p
 
 def generate_code(question: str, df_preview: str) -> str:
     """Generate python code (operating on a ``df`` DataFrame) to answer *question*."""
-    model = os.environ.get("CODE_MODEL", "deepseek-ai/DeepSeek-V3")
+    model = os.environ.get("CODE_MODEL", "deepseek_v4")
     system = CODE_SYSTEM_PROMPT + "\n\n【df 预览（前几行）】\n" + df_preview
     resp = _client().chat.completions.create(
         model=model,
@@ -323,7 +357,7 @@ def can_answer(question: str, context: str) -> bool:
     """
     import json
 
-    model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
+    model = os.environ.get("RAG_MODEL", "deepseek_v4")
     user = f"【用户问题】\n{question}\n\n【参考上下文】\n{context}"
     resp = _client().chat.completions.create(
         model=model,
@@ -344,7 +378,7 @@ def review_answer(question: str, context: str, answer: str) -> tuple[bool, str]:
     """Review *answer* against *question* and *context*. Returns ``(pass, reason)``."""
     import json
 
-    model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
+    model = os.environ.get("RAG_MODEL", "deepseek_v4")
     user = (
         f"【用户问题】\n{question}\n\n"
         f"【参考上下文】\n{context}\n\n"
@@ -383,7 +417,7 @@ def cross_validate(question: str, sql_result: str, text_context: str) -> str:
     SQL results are authoritative for numeric/aggregate facts; text context is
     the fallback when SQL is empty or errored. Returns the final answer.
     """
-    model = os.environ.get("RAG_MODEL", "deepseek-ai/DeepSeek-V3")
+    model = os.environ.get("RAG_MODEL", "deepseek_v4")
     user = (
         f"【用户问题】\n{question}\n\n"
         f"【SQL 执行结果】\n{sql_result}\n\n"

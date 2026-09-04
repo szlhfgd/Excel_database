@@ -15,11 +15,11 @@ showSidebarBorder = true
 baseRadius = "10px"
 buttonRadius = "10px"
 
-# 字体：拉丁/数字用 Inter，中文用 Noto Sans SC；字体加载失败时回退系统字体
-# （Windows 微软雅黑 / macOS 苹方），保证中文始终可读
-font = "'Inter', 'Noto Sans SC', 'Microsoft YaHei', 'PingFang SC', sans-serif:https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Noto+Sans+SC:wght@300;400;500;600;700&display=swap"
-headingFont = "'Inter', 'Noto Sans SC', 'Microsoft YaHei', 'PingFang SC', sans-serif:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&family=Noto+Sans+SC:wght@500;600;700&display=swap"
-codeFont = "'JetBrains Mono', 'Noto Sans Mono', 'Microsoft YaHei', monospace:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Noto+Sans+Mono:wght@400;500&display=swap"
+# 字体：Streamlit config.toml 的 font 格式为 "字体名:source_url"，冒号前
+# 只能有一个字体名。中文回退由浏览器/OS 处理（微软雅黑等）。
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@600;700&display=swap"
+codeFont = "JetBrains Mono:https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
 
 # 字号：正文放至 16px（中文更易读）；标题层级从 30px 到 13px 递减
 baseFontSize = 16

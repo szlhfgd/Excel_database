@@ -143,7 +143,9 @@ def build_embeddings(conn: db.sqlite3.Connection, name: str, on_progress=None, c
     texts = [_search_text_for_row(r, SEARCH_COLS) for r in rows]
     vectors: list[list[float]] = []
     n = len(texts)
-    batch = 32
+    # Batch size for embedding calls. SiliconFlow handles 32 fast; lower it
+    # only if a slower embedding provider is used. Tunable via EMBED_BATCH_SIZE.
+    batch = int(os.environ.get("EMBED_BATCH_SIZE", "32"))
     for i in range(0, n, batch):
         chunk = texts[i : i + batch]
         vecs = llm.embed(chunk)

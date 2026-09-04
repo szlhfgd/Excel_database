@@ -79,5 +79,5 @@ The columns and sample rows of a table, supplied to the LLM to ground NL2SQL gen
 _Avoid_: metadata, structure
 
 **LLM (大模型)**
-The external model service (SiliconFlow) that provides embeddings and NL2SQL. The only component that calls outside the local process.
+The external model services used by the app. Chat / NL2SQL / RAG route to a self-hosted custom platform (JAC); embedding and rerank route to SiliconFlow for inference speed. These are the only components that call outside the local process.
 _Avoid_: model, AI

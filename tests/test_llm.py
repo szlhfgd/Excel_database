@@ -98,7 +98,7 @@ def test_embed_passes_input_and_returns_vectors():
     class FakeClient:
         embeddings = type("E", (), {"create": FakeEmbed().create})()
 
-    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+    with mock.patch.object(llm, "_sf_client", return_value=FakeClient()):
         out = llm.embed(["a", "b"])
     assert len(out) == 2
     assert all(len(v) == 1024 for v in out)
@@ -125,10 +125,72 @@ def test_embed_sanitizes_and_truncates_inputs():
     class FakeClient:
         embeddings = type("E", (), {"create": FakeEmbed().create})()
 
-    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+    with mock.patch.object(llm, "_sf_client", return_value=FakeClient()):
         out = llm.embed([None, 1.5, long_text, "keep"])
     assert len(out) == 4
     assert captured["input"] == cleaned
+
+
+def test_empty_api_key_raises_friendly_runtime_error():
+    """When JAC_API_KEY is unset/empty (e.g. .env not loaded by Streamlit),
+    _client() must raise a Chinese RuntimeError — not a raw openai.OpenAIError
+    that would surface as 'Connection lost.' in the UI."""
+    with mock.patch.dict(os.environ, {"JAC_API_KEY": ""}, clear=False):
+        try:
+            llm._client()
+            assert False, "should have raised"
+        except RuntimeError as e:
+            assert "JAC_API_KEY" in str(e)
+        except Exception:
+            assert False, "raw SDK error leaked (openai.OpenAIError), not friendly RuntimeError"
+
+
+def test_embed_auth_error_raises_friendly_chinese_message():
+    """A 401 from the platform must surface as a readable Chinese RuntimeError,
+    not a raw openai.AuthenticationError — so the UI shows st.error() instead of
+    'Connection lost.'."""
+    from openai import AuthenticationError
+
+    class FakeEmbed:
+        def create(self, **kwargs):
+            raise AuthenticationError(
+                message="invalid api key",
+                response=mock.Mock(status_code=401, headers={}),
+                body=None,
+            )
+
+    class FakeClient:
+        embeddings = type("E", (), {"create": FakeEmbed().create})()
+
+    with mock.patch.object(llm, "_sf_client", return_value=FakeClient()):
+        try:
+            llm.embed(["x"])
+            assert False, "should have raised"
+        except RuntimeError as e:
+            assert "SILICONFLOW_API_KEY" in str(e)
+        except AuthenticationError:
+            assert False, "raw SDK error leaked through without friendly wrapper"
+
+
+def test_embed_connection_error_raises_friendly_chinese_message():
+    """A connection/timeout failure must surface as a readable Chinese RuntimeError."""
+    from openai import APIConnectionError
+
+    class FakeEmbed:
+        def create(self, **kwargs):
+            raise APIConnectionError(request=mock.Mock(url="http://x"))
+
+    class FakeClient:
+        embeddings = type("E", (), {"create": FakeEmbed().create})()
+
+    with mock.patch.object(llm, "_sf_client", return_value=FakeClient()):
+        try:
+            llm.embed(["x"])
+            assert False, "should have raised"
+        except RuntimeError as e:
+            assert "SILICONFLOW" in str(e)
+        except APIConnectionError:
+            assert False, "raw SDK error leaked through without friendly wrapper"
 
 
 def test_truncate_token_safe_keeps_short_text_unchanged():

@@ -11,6 +11,10 @@ import json
 import os
 import tempfile
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from src.services.queries import (
     ask_query,
     build_stats_data,
