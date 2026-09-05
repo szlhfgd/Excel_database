@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "StrutData_db — 电子表格数据库架构",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "output": "strutdata-architecture.html",
+    "viewBox": [1280, 385],
+    "repository": {
+      "url": "https://github.com/szlhfgd/StrutData_db.git",
+      "revision": "370f73d017a6bfd8d2bd61b289ee33dc8a07469c"
+    },
+    "views": [
+      { "id": "import-path", "label": "导入流程", "focus": ["ui", "ingest", "db", "llm-embed"], "note": "文件上传 → 清洗 → 建表 → 向量化 → 存储" },
+      { "id": "query-path", "label": "查询流程", "focus": ["ui", "queries", "search", "db", "llm-nl2sql", "llm-rag"], "note": "用户查询 → 混合检索 / NL2SQL / RAG → 结果返回" },
+      { "id": "ai-layer", "label": "AI 能力层", "focus": ["llm-embed", "llm-nl2sql", "llm-rag", "llm-rerank", "code-exec", "web-search", "sql-guard"], "note": "Embedding、NL2SQL、RAG、重排、代码执行、网络搜索、SQL 守卫" }
+    ]
+  },
+  "components": [
+    { "id": "ui", "type": "frontend", "label": "Streamlit UI", "sublabel": "app.py", "pos": [540, 30], "size": [200, 40], "sources": [{ "path": "app.py", "line": 1, "label": "入口" }] },
+
+    { "id": "ingest", "type": "backend", "label": "导入服务", "sublabel": "src/services/ingest.py", "pos": [140, 105], "size": [200, 56], "sources": [{ "path": "src/services/ingest.py", "line": 1, "label": "导入编排" }] },
+    { "id": "queries", "type": "backend", "label": "查询编排", "sublabel": "src/services/queries.py", "pos": [540, 105], "size": [200, 56] },
+    { "id": "search", "type": "backend", "label": "混合检索", "sublabel": "src/services/search.py", "pos": [920, 105], "size": [200, 56], "sources": [{ "path": "src/services/search.py", "line": 1, "label": "BM25+向量+RRF" }] },
+
+    { "id": "db", "type": "database", "label": "SQLite + sqlite-vec", "sublabel": "src/data/db.py", "pos": [40, 190], "size": [220, 56], "sources": [{ "path": "src/data/db.py", "line": 1, "label": "数据访问层" }] },
+    { "id": "llm-embed", "type": "cloud", "label": "Embedding", "sublabel": "SiliconFlow bge-m3", "pos": [380, 190], "size": [200, 56], "tag": "向量化" },
+    { "id": "llm-nl2sql", "type": "cloud", "label": "NL2SQL", "sublabel": "JAC DeepSeek-V3", "pos": [640, 190], "size": [200, 56], "tag": "自然语言转SQL" },
+    { "id": "llm-rag", "type": "cloud", "label": "RAG 回答", "sublabel": "JAC DeepSeek-V3", "pos": [940, 190], "size": [200, 56], "tag": "检索增强" },
+
+    { "id": "sql-guard", "type": "security", "label": "SQL 守卫", "sublabel": "src/ai/execute_sql.py", "pos": [40, 275], "size": [200, 56], "sources": [{ "path": "src/ai/execute_sql.py", "line": 1, "label": "只读防护" }] },
+    { "id": "llm-rerank", "type": "cloud", "label": "Rerank", "sublabel": "SiliconFlow bge-reranker", "pos": [340, 275], "size": [200, 56], "tag": "语义重排" },
+    { "id": "code-exec", "type": "backend", "label": "代码解释器", "sublabel": "src/ai/code_exec.py", "pos": [640, 275], "size": [200, 56], "sources": [{ "path": "src/ai/code_exec.py", "line": 1, "label": "沙箱执行" }] },
+    { "id": "web-search", "type": "external", "label": "网络搜索", "sublabel": "AnySearch MCP", "pos": [940, 275], "size": [200, 56], "sources": [{ "path": "src/ai/websearch.py", "line": 1, "label": "兜底搜索" }] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "应用层", "wraps": ["ui"], "pad": 16 },
+    { "kind": "region", "label": "服务编排层", "wraps": ["ingest", "queries", "search"], "pad": 16 },
+    { "kind": "region", "label": "数据访问层", "wraps": ["db"], "pad": 16 },
+    { "kind": "region", "label": "AI 能力层", "wraps": ["llm-embed", "llm-nl2sql", "llm-rag", "llm-rerank", "code-exec", "web-search", "sql-guard"], "pad": 16 }
+  ],
+  "connections": [
+    { "id": "ui-to-ingest", "from": "ui", "to": "ingest", "label": "文件导入", "variant": "emphasis", "fromSide": "bottom", "toSide": "top" },
+    { "id": "ui-to-queries", "from": "ui", "to": "queries", "label": "查询/统计", "variant": "emphasis", "fromSide": "bottom", "toSide": "top", "labelAt": [795, 100] },
+    { "id": "ingest-to-db", "from": "ingest", "to": "db", "fromSide": "bottom", "toSide": "top" },
+    { "id": "ingest-to-llm-embed", "from": "ingest", "to": "llm-embed", "label": "向量化", "fromSide": "right", "toSide": "top" },
+    { "id": "queries-to-search", "from": "queries", "to": "search", "label": "混合检索", "fromSide": "right", "toSide": "left" },
+    { "id": "queries-to-llm-nl2sql", "from": "queries", "to": "llm-nl2sql", "label": "NL2SQL", "fromSide": "bottom", "toSide": "top", "labelAt": [585, 176] },
+    { "id": "queries-to-llm-rag", "from": "queries", "to": "llm-rag", "label": "RAG 问答", "fromSide": "bottom", "toSide": "top" },
+    { "id": "db-to-sql-guard", "from": "db", "to": "sql-guard", "label": "只读守卫", "variant": "security", "fromSide": "bottom", "toSide": "top" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "核心数据流", "items": ["Excel/CSV → 清洗 → SQLite 表 + __row_text", "每行文本 → bge-m3 → 1024 维向量 → sqlite-vec", "查询 → 向量化 → 语义检索 + BM25 → RRF 融合 → 整行返回"] },
+    { "dot": "emerald", "title": "查询模式", "items": ["hybrid: 语义 + 关键词混合搜索 (RRF)", "ask: NL2SQL (DeepSeek-V3) + 自动重试", "sql: 手写 SQL 直执 (只读守卫)", "rag: 检索上下文 → LLM 回答 (流式/多轮)", "rag+code: 生成 pandas 代码 → 沙箱执行", "rag+dual: SQL 结果 + 文本检索 → 交叉验证"] },
+    { "dot": "violet", "title": "AI 双通道", "items": ["Embedding/Rerank: SiliconFlow (bge-m3 / bge-reranker-v2-m3)", "NL2SQL/RAG/Decompose: JAC 平台 (DeepSeek-V3)", "代码解释器: 受限沙箱 (pandas/numpy/安全内置函数)", "网络搜索: AnySearch MCP JSON-RPC 兜底"] },
+    { "dot": "rose", "title": "安全与约束", "items": ["只读 SQL 守卫: 禁止 DROP/DELETE/UPDATE/多语句", "read-only 连接 + PRAGMA query_only = ON", "API Key 仅在 .env (gitignore)", "单用户本地运行，无认证"] }
+  ]
+}
