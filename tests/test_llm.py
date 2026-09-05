@@ -700,3 +700,69 @@ def test_cross_validate_returns_content():
     assert "问题" in captured["messages"][1]["content"]
     assert "SQL 结果" in captured["messages"][1]["content"]
     assert "文本上下文" in captured["messages"][1]["content"]
+
+
+def test_chat_model_not_found_raises_friendly_chinese_message():
+    """A 503 ``model_not_found`` from the tokenhub gateway must surface as a
+    readable Chinese RuntimeError naming the model and the .env vars to check —
+    not a raw openai.InternalServerError. This is the bug class that produced
+    `No available channel for this model` when NL2SQL_MODEL pointed at a name
+    the gateway had no channel for."""
+    from openai import InternalServerError
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            raise InternalServerError(
+                message="Error code: 503 - {'error': {'message': 'No available channel for this model', 'type': 'tokenhub_error', 'param': '', 'code': 'model_not_found'}}",
+                response=mock.Mock(status_code=503, headers={}),
+                body=None,
+            )
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        try:
+            llm.generate_sql(
+                [{"table": "t", "columns": [("a", "INTEGER")], "sample_rows": []}],
+                "q",
+            )
+            assert False, "should have raised"
+        except RuntimeError as e:
+            s = str(e)
+            assert "model_not_found" in s
+            assert "deepseek_v4" in s  # the default model name flows into the message
+            assert "NL2SQL_MODEL" in s
+            assert ".env" in s
+        except InternalServerError:
+            assert False, "raw SDK 503 leaked through without friendly wrapper"
+
+
+def test_chat_passes_through_non_model_not_found_internal_errors():
+    """A 503 that is NOT a model_not_found (e.g. gateway overloaded) must still
+    pass through as InternalServerError — _chat should only translate the
+    specific config-error signature, not swallow all 503s."""
+    from openai import InternalServerError
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            raise InternalServerError(
+                message="Error code: 503 - {'error': {'message': 'Service Unavailable', 'code': 'overloaded'}}",
+                response=mock.Mock(status_code=503, headers={}),
+                body=None,
+            )
+
+    class FakeClient:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    with mock.patch.object(llm, "_client", return_value=FakeClient()):
+        try:
+            llm.generate_sql(
+                [{"table": "t", "columns": [("a", "INTEGER")], "sample_rows": []}],
+                "q",
+            )
+            assert False, "should have raised"
+        except InternalServerError:
+            pass  # correct: non-model_not_found 503 passes through unchanged
+        except RuntimeError:
+            assert False, "non-model_not_found 503 was wrongly translated to RuntimeError"

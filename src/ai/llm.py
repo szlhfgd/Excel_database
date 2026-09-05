@@ -1,7 +1,13 @@
 import json
 import os
 import urllib.request
-from openai import OpenAI, APIConnectionError, AuthenticationError, APITimeoutError
+from openai import (
+    OpenAI,
+    APIConnectionError,
+    AuthenticationError,
+    APITimeoutError,
+    InternalServerError,
+)
 
 
 def _client() -> OpenAI:
@@ -32,6 +38,31 @@ def _sf_client() -> OpenAI:
         timeout=float(os.environ.get("LLM_TIMEOUT", "120")),
         max_retries=0,
     )
+
+
+def _chat(**kwargs):
+    """Call the JAC chat API, translating gateway ``model_not_found`` into a
+    clear Chinese config error.
+
+    tokenhub returns HTTP 503 with ``code: model_not_found`` / ``No available
+    channel for this model`` when the requested model name has no upstream
+    channel provisioned. Without this wrapper the user sees a raw
+    ``openai.InternalServerError``; with it they get a message naming the model
+    to fix in .env. All other errors pass through unchanged.
+    """
+    try:
+        return _client().chat.completions.create(**kwargs)
+    except InternalServerError as exc:
+        msg = str(exc)
+        if "model_not_found" in msg or "No available channel" in msg:
+            model = kwargs.get("model", "?")
+            raise RuntimeError(
+                f"模型服务网关未配置该模型（model_not_found）：当前请求的模型名为 "
+                f"`{model}`，网关没有可用的上游通道。请检查 .env 中的 "
+                f"NL2SQL_MODEL / RAG_MODEL / DECOMPOSE_MODEL / CODE_MODEL 等变量，"
+                f"确保其值是网关已开通的模型名。"
+            ) from exc
+        raise
 
 
 # Maximum characters sent to the embedding model per input. The custom platform
@@ -146,7 +177,7 @@ def generate_sql(table_schemas: list[dict], query: str, prev_error: str | None =
     user_msg = query
     if prev_error:
         user_msg = f"之前生成的 SQL 执行出错：{prev_error}\n请修正并只输出正确 SQL。\n原问题：{query}"
-    resp = _client().chat.completions.create(
+    resp = _chat(
         model=model,
         messages=[
             {"role": "system", "content": system},
@@ -182,7 +213,7 @@ def decompose_question(question: str, schemas: list[dict]) -> list[str]:
         for s in schemas
     )
     system = DECOMPOSE_SYSTEM_PROMPT + "\n\n可用表结构：\n" + schema_block
-    resp = _client().chat.completions.create(
+    resp = _chat(
         model=model,
         messages=[
             {"role": "system", "content": system},
@@ -234,7 +265,7 @@ def answer(question: str, context: str, source: str | None = None) -> str:
             f"请在回答末尾另起一行原样标注：【来源：{source}】，"
             f"不要删减其中的表名与行号。"
         )
-    resp = _client().chat.completions.create(
+    resp = _chat(
         model=model,
         messages=[
             {"role": "system", "content": system},
@@ -265,7 +296,7 @@ def answer_stream(question: str, context: str, source: str | None = None, histor
     if history:
         messages.extend(history[-MAX_HISTORY_TURNS:])
     messages.append({"role": "user", "content": question})
-    stream = _client().chat.completions.create(
+    stream = _chat(
         model=model,
         messages=messages,
         temperature=0.0,
@@ -323,7 +354,7 @@ def generate_code(question: str, df_preview: str) -> str:
     """Generate python code (operating on a ``df`` DataFrame) to answer *question*."""
     model = os.environ.get("CODE_MODEL", "deepseek_v4")
     system = CODE_SYSTEM_PROMPT + "\n\n【df 预览（前几行）】\n" + df_preview
-    resp = _client().chat.completions.create(
+    resp = _chat(
         model=model,
         messages=[
             {"role": "system", "content": system},
@@ -359,7 +390,7 @@ def can_answer(question: str, context: str) -> bool:
 
     model = os.environ.get("RAG_MODEL", "deepseek_v4")
     user = f"【用户问题】\n{question}\n\n【参考上下文】\n{context}"
-    resp = _client().chat.completions.create(
+    resp = _chat(
         model=model,
         messages=[
             {"role": "system", "content": CAN_ANSWER_SYSTEM_PROMPT},
@@ -384,7 +415,7 @@ def review_answer(question: str, context: str, answer: str) -> tuple[bool, str]:
         f"【参考上下文】\n{context}\n\n"
         f"【待审核回答】\n{answer}"
     )
-    resp = _client().chat.completions.create(
+    resp = _chat(
         model=model,
         messages=[
             {"role": "system", "content": REVIEW_SYSTEM_PROMPT},
@@ -423,7 +454,7 @@ def cross_validate(question: str, sql_result: str, text_context: str) -> str:
         f"【SQL 执行结果】\n{sql_result}\n\n"
         f"【文本检索上下文】\n{text_context}"
     )
-    resp = _client().chat.completions.create(
+    resp = _chat(
         model=model,
         messages=[
             {"role": "system", "content": CROSS_VALIDATE_SYSTEM_PROMPT},
